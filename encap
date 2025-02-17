@@ -5,6 +5,10 @@ import glob
 import warnings
 import platform
 
+# name generation
+import datetime
+import random
+
 import encap_lib.encap_settings as settings
 from encap_lib.machines import LocalMachine
 from encap_lib.encap_lib import get_machine, filename_and_file_extension, get_interpreter_from_file_extension, extract_folder_name
@@ -28,6 +32,46 @@ done < <(tail -f {run_folder_name}/{log_file_name})
 """, verbose=True, output=True)
     
     machine.pull(run_folder_name, run_folder_name, directory=True)
+
+
+ADJECTIVES = [
+    "agile", "alert", "ancient", "ardent", "artful", "astonishing", "bold", "brave", "brilliant",
+    "calm", "careful", "cautious", "charming", "clever", "colossal", "courageous", "crafty", 
+    "cunning", "daring", "dauntless", "dazzling", "devoted", "eager", "ebullient", "eccentric", 
+    "elusive", "energetic", "enlightened", "epic", "fearless", "fiery", "fierce", "flashy", 
+    "flawless", "focused", "formidable", "gallant", "gifted", "glorious", "graceful", "grand", 
+    "gregarious", "gritty", "heroic", "honest", "intrepid", "invincible", "jolly", "keen", 
+    "lively", "luminous", "magnificent", "majestic", "marvelous", "mighty", "mischievous", 
+    "mysterious", "nimble", "observant", "omniscient", "outlandish", "outstanding", "passionate", 
+    "patient", "perceptive", "persistent", "playful", "plucky", "proud", "quick", "radiant", 
+    "reliable", "resilient", "resolute", "resourceful", "rugged", "savvy", "shrewd", "silent", 
+    "sleek", "sly", "spirited", "steadfast", "stubborn", "swift", "tenacious", "thoughtful", 
+    "undaunted", "unpredictable", "unyielding", "valiant", "vibrant", "vigorous", "vivid", 
+    "wary", "wily", "wise", "witty", "zealous"
+]
+ANIMALS = [
+    "aardvark", "albatross", "anaconda", "antelope", "armadillo", "axolotl", "badger", "basilisk", 
+    "bat", "beetle", "bison", "blackbird", "bobcat", "buffalo", "butterfly", "caracal", "cassowary", 
+    "catfish", "centipede", "cheetah", "cormorant", "cougar", "coyote", "crane", "crocodile", "crow", 
+    "dingo", "dolphin", "dragonfly", "eagle", "echidna", "egret", "elephant", "emu", "falcon", 
+    "ferret", "firefly", "fox", "frog", "gazelle", "gecko", "giraffe", "glowworm", "gorilla", 
+    "grizzly", "hammerhead", "hare", "harrier", "hawk", "hedgehog", "heron", "hornet", "hyena", 
+    "ibex", "ibis", "iguana", "jackal", "jaguar", "jellyfish", "kangaroo", "kingfisher", "koala", 
+    "kraken", "lemur", "leopard", "lion", "lynx", "mandrill", "meerkat", "mockingbird", "mongoose", 
+    "moose", "moth", "narwhal", "ocelot", "octopus", "opossum", "oryx", "osprey", "otter", 
+    "owl", "panda", "panther", "parrot", "peacock", "pelican", "penguin", "phoenix", "piranha", 
+    "platypus", "porcupine", "puma", "quail", "quokka", "raccoon", "ram", "raven", "red panda", 
+    "reindeer", "roadrunner", "salamander", "scorpion", "seahorse", "serval", "shark", "skunk", 
+    "sloth", "snow leopard", "squid", "stag", "stingray", "swan", "tarantula", "tiger", "tortoise", 
+    "toucan", "viper", "vulture", "wallaby", "warthog", "weasel", "whale", "wildebeest", "wolf", 
+    "wolverine", "wombat", "woodpecker", "yak", "zebra"
+]
+
+def generate_experiment_name():
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    adjective = random.choice(ADJECTIVES)
+    animal = random.choice(ANIMALS)
+    return f"{timestamp}_{adjective}_{animal}"
 
 
 def run(machine, file_extension, args, run_folder_name, target_file, target_file_path, interprter_args="", number_of_instances=1):
@@ -220,7 +264,8 @@ def create_folder_and_check_if_experiment_exists(machine, pargs, folder_name, ru
         raise Exception(f"Unexpected value {out}.")
     
 def mode_run_file(folder_name, run_folder_name, source_file_path, local_project_dir, target_file_path, machine, pargs, interpreter_args=""):
-    assert pargs.name is not None, "The experiment_name -n must be specified."
+    # If no name is provided, generate one
+    experiment_name = pargs.name if pargs.name else generate_experiment_name()
 
     #Syncs folders
     machine.sync_files()
