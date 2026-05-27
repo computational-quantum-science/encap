@@ -45,7 +45,8 @@ def get_machine(vm, local_project_dir):
         settings_project = settings.get_all_items(["projects", local_project_dir, "ssh", vm])
 
         ssh_kwargs = {}
-        copy_dict_keys = ["ssh_options", "ssh_ignore", "sync_files", "rsync_exclude", "sync"]
+        copy_dict_keys = ["ssh_options", "ssh_ignore", "sync_files", "rsync_exclude",
+                          "rsync_exclude_push", "rsync_exclude_pull", "sync"]
 
         for key in copy_dict_keys:
             if settings_project[key] is not None:

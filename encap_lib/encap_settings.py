@@ -116,7 +116,8 @@ config_file_name = os.path.join(config_folder, "config.yml")
 running_processes_file = os.path.join(home, ".encap", "running_processes.yml")
 
 config_items = ["dir", "ip", "sync", "user", "ssh_ignore", "ssh_options", "sync_files",
-                "rsync_exclude", "project", "zone", "nfs", "machine_config",
+                "rsync_exclude", "rsync_exclude_push", "rsync_exclude_pull",
+                "project", "zone", "nfs", "machine_config",
                 "GOOGLE_APPLICATION_CREDENTIALS", "machine_config", "slurm"]
 
 default_extensions = {"py": "python -u", "sh": "bash", "jl": "julia"}

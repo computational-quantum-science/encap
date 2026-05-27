@@ -89,7 +89,9 @@ class Machine:
 class SSHMachine(Machine):
 
     def __init__(self, ip, username, local_project_dir, remote_project_dir, ssh_options="",
-                ssh_ignore=[], sync_files=[], rsync_exclude=[], sync=True, **kwargs):
+                ssh_ignore=[], sync_files=[], rsync_exclude=[],
+                rsync_exclude_push=[], rsync_exclude_pull=[],
+                sync=True, **kwargs):
         super().__init__(**kwargs)
         self.ip = ip
         self.username = username
@@ -98,7 +100,16 @@ class SSHMachine(Machine):
         self.ssh_options = ssh_options
         self.ssh_ignore = ssh_ignore
         self._sync_files = sync_files
-        self.rsync_exclude = rsync_exclude
+        # Direction-specific exclude lists:
+        #   - rsync_exclude_push: patterns NOT shipped local->remote (e.g. local
+        #     caches, build artifacts you don't want on the cluster).
+        #   - rsync_exclude_pull: patterns NOT pulled remote->local (e.g.
+        #     cluster-only scratch dirs you don't want on disk locally).
+        # The legacy `rsync_exclude` key is treated as additive to push only
+        # (its original behavior, since pull was scp and ignored excludes).
+        # To exclude a pattern in both directions, list it in both new keys.
+        self.rsync_exclude_push = list(rsync_exclude) + list(rsync_exclude_push)
+        self.rsync_exclude_pull = list(rsync_exclude_pull)
         self.sync = sync
 
     @property
@@ -130,9 +141,18 @@ class SSHMachine(Machine):
         output = run_code_local(c, ignore=ignore, *args, **kwargs)
         return output
 
-    def push(self, name_local, name_target, directory=True, *args, **kwargs):
+    def push(self, name_local, name_target, directory=True, copy_full_dir=True, *args, **kwargs):
         # Upload file to VM
         if not self.sync and name_local == name_target:
+            return None
+
+        # "Self-push" (name_local == name_target) for which the local file
+        # doesn't exist is treated as a no-op: in folder-mode the source has
+        # already been pushed via the parent-dir rsync, so a redundant scp
+        # of a file that only exists on the remote would just fail.
+        if name_local == name_target and not os.path.exists(
+            os.path.join(self.local_project_dir, name_local)
+        ):
             return None
 
         i = name_target[::-1].find("/")
@@ -147,15 +167,26 @@ class SSHMachine(Machine):
 
         if directory:
             recursiv = "-r"
+            if not copy_full_dir:
+                # Copy *contents* of name_local into name_target rather than
+                # nesting the source folder inside it (mirrors LocalMachine.push).
+                name_local = name_local.rstrip("/") + "/."
         else:
             recursiv = ""
 
-        code = f"scp {self.ssh_options} {recursiv} {self.local_project_dir}/{name_local} {self.username}@{self.ip}:{self.remote_project_dir}/{folder}"
+        # -p preserves mtimes/modes so subsequent rsync quick-checks don't
+        # spuriously decide every file differs.
+        code = f"scp -p {self.ssh_options} {recursiv} {self.local_project_dir}/{name_local} {self.username}@{self.ip}:{self.remote_project_dir}/{folder}"
         return run_code_local(code, *args, **kwargs)
 
     def pull(self, file_name_vm, file_name_local, directory=False, *args, **kwargs):
-        # Download file from VM
-        #assert name_local != ""
+        # Download from VM via rsync.
+        # Benefits over scp: delta-transfer (only changed blocks fly),
+        # mtime preservation, better progress output, symmetric with rsync_push.
+        # The exclude list used here is `rsync_exclude_pull` -- distinct from
+        # `rsync_exclude_push` because the two directions usually have opposite
+        # intent (push wants to keep junk off the cluster, pull wants to bring
+        # back outputs that often match push-exclude patterns).
         if not self.sync and file_name_vm == file_name_local:
             return None
 
@@ -171,14 +202,35 @@ class SSHMachine(Machine):
             run_code_local(code, *args, **kwargs)
 
         if directory:
-            recursiv = "-r"
+            options = "-rz"
         else:
-            recursiv = ""
+            options = "-z"
 
-        code = f"scp {self.ssh_options} {recursiv} {self.username}@{self.ip}:{self.remote_project_dir}/{file_name_vm} {self.local_project_dir}/{folder}"
+        # --update protects local edits made while a -vm job is still running:
+        # if the user edited a local file after the push but before the
+        # post-run pull, rsync skips it (local mtime newer than the unchanged
+        # remote copy). New outputs written by the remote script always have
+        # later mtimes than anything local, so --update doesn't suppress them.
+        options = "--update " + options
+
+        for exclude in self.rsync_exclude_pull:
+            options = f"--exclude '{exclude}' " + options
+
+        default_ignore = self.ssh_ignore + [
+            "sending incremental", "receiving incremental",
+            "sent ", "total size",
+        ]
+        if "ignore" in kwargs:
+            kwargs["ignore"] = default_ignore + kwargs["ignore"]
+        else:
+            kwargs["ignore"] = default_ignore
+
+        code = f"""rsync {options} -v -e "ssh {self.ssh_options}" {self.username}@{self.ip}:{self.remote_project_dir}/{file_name_vm} {self.local_project_dir}/{folder}"""
         run_code_local(code, *args, **kwargs)
 
-    def rsync_push(self, name_local, name_target, directory=True, dry_run=False, last_timestamp_prevails=True, delete=False, *args, **kwargs):
+    def rsync_push(self, name_local, name_target, directory=True, dry_run=False,
+                   last_timestamp_prevails=True, delete=False, ignore_times=False,
+                   *args, **kwargs):
         # Upload file to VM
 
         i = name_target[::-1].find("/")
@@ -205,7 +257,13 @@ class SSHMachine(Machine):
         if delete:
             options = "--delete " + options
 
-        for exclude in self.rsync_exclude:
+        if ignore_times:
+            # Skip rsync's mtime/size short-circuit; transfer everything that
+            # would otherwise be quick-checked out. Used by encap's
+            # -fp/--force-push CLI flag.
+            options = "--ignore-times " + options
+
+        for exclude in self.rsync_exclude_push:
             options = f"--exclude '{exclude}' " + options
 
         code = f"""rsync {options} -v -e "ssh {self.ssh_options}" {self.local_project_dir}/{name_local} {self.username}@{self.ip}:{self.remote_project_dir}/{folder}"""
@@ -261,6 +319,26 @@ class LocalMachine(Machine):
 
             code = f"cp {recursiv} {self.local_project_dir}/{name_local} {self.local_project_dir}/{folder}"
             run_code_local(code, *args, **kwargs)
+
+    def rsync_push(self, name_local, name_target, directory=True,
+                   dry_run=False, last_timestamp_prevails=True,
+                   delete=False, ignore_times=False, *args, **kwargs):
+        """Local equivalent of SSHMachine.rsync_push.
+
+        For LocalMachine, source and target paths refer to the same
+        filesystem, so a 'push' is either a no-op (when source == target,
+        e.g. a local `encap rerun` where the experiment dir is already in
+        place) or a local `cp`. The rsync-only kwargs (dry_run,
+        last_timestamp_prevails, delete, ignore_times) have no analog for
+        cp and are accepted-and-ignored so callers can use a single API.
+        """
+        # rsync's trailing-slash-on-source means "copy contents, not the
+        # folder itself" -- map that to LocalMachine.push's copy_full_dir=False.
+        copy_full_dir = not name_local.endswith("/")
+        name_local = name_local.rstrip("/")
+        name_target = name_target.rstrip("/")
+        return self.push(name_local, name_target, directory=directory,
+                         copy_full_dir=copy_full_dir, *args, **kwargs)
 
     def pull(self, name_vm, name_local, directory=False, *args, **kwargs):
         pass
