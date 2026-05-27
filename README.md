@@ -86,6 +86,16 @@ encap rerun scripts/my_script.py -n test
 ```
 This command re-runs the experiment without copying the script again. This is useful if you want to re-run an old experiment with different parameters. For instance, you can copy the script (using the copy command), modify the parameters, and then rerun the updated script.
 
+## Following an Experiment with `encap tail`
+
+If you started an experiment in another shell, or detached from a remote `-vm` run while the job is still going on the cluster, you can re-attach to its log later:
+```bash
+encap tail scripts/my_script.py -n test
+```
+This streams the log in real time and exits cleanly when the experiment finishes — either when the script writes its end-of-transmission marker on normal exit, or, for Slurm jobs, when the job leaves the queue (so `scancel`, walltime kills, and OOMs are detected too). For experiments that have already completed, the full log is dumped once and `encap tail` returns.
+
+Combine with `-vm <machine_name>` to follow a remote job.
+
 ## Running Multiple Experiments in Parallel
 
 #### my_script.py
@@ -232,13 +242,19 @@ If you often forget to commit your changes before performing a simulation, you c
 git-track-force: <repo_dir_3>
 ```
 
-## Configuring SSH (untested with newest features)
+## Configuring SSH
 
-You can execute scripts on a remote server through SSH. To do this, a mirror of the local folder is created on the remote server.
-
+You can execute scripts on a remote server through SSH. Encap mirrors the project folder on the remote, runs the experiment there, and pulls results back when it finishes — all in a single command.
 ```bash
-encap run scripts/my_script.py -name <version_name> -vm <machine_name>
+encap run scripts/my_script.py -n <version_name> -vm <machine_name>
 ```
+The same `-vm` flag works with `rerun` and `tail`. It can be combined with the Slurm flags to submit a Slurm job on the remote in one step.
+
+Transfers in both directions use `rsync`, so only changed files cross the network and mtimes are preserved. If you ever need to bypass the change-detection (for example after a clock-skew incident on the remote), use `-fp` / `--force-push` to transfer regardless of timestamps:
+```bash
+encap run scripts/my_script.py -n <version_name> -vm <machine_name> -fp
+```
+
 The configuration file is located at `~/.encap/config.yml`:
 ```yml
 file_extension:
@@ -258,10 +274,14 @@ projects:
 ssh_ignore: ["X11 forwarding request failed on channel"]
 ```
 
-### Ignore folders while rsyncing between local and remote machine
+### Excluding files from rsync
+
+Push (local → remote) and pull (remote → local) have separate exclude lists, since they usually have opposite intent.
 ```yml
-rsync_exclude: [".git", "*log*"]
+rsync_exclude_push: [".git", "__pycache__", "*.hdf5"]   # don't ship up
+rsync_exclude_pull: ["__pycache__"]                       # don't bring back
 ```
+The legacy single `rsync_exclude` key is still accepted and is treated as an alias for `rsync_exclude_push`.
 
 ## Configuring Google Cloud
 TODO

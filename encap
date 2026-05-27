@@ -18,19 +18,67 @@ from encap_lib.status import get_status, print_status
 import encap_lib.git_tracker as git_tracker
 
 def tail_pull(machine, run_folder_name, pid=None, log_file_name="log"):
-    if pid is not None and platform.system() != "Darwin":
+    # `pid` can be:
+    #   - None                       no tracked process, fall back to EOT loop
+    #   - "<digits>"                 OS PID on the remote (non-slurm run)
+    #   - "slurm:<jobid>"            slurm job id (set by run_slurm so encap
+    #                                tail can poll squeue)
+    is_slurm = isinstance(pid, str) and pid.startswith("slurm:")
+    is_os_pid = isinstance(pid, str) and pid.isdigit()
+
+    if is_slurm:
+        # Stream the log AND poll squeue. Exits on either the EOT marker
+        # (normal completion) or when the slurm job leaves the queue (catches
+        # scancel, walltime cap, OOM kill, etc.). `-n +1` so we dump the full
+        # log on attach, matching the --pid branch below.
+        jobid = pid.split(":", 1)[1]
+        machine.run_code(f"""#!/bin/bash
+touch {run_folder_name}/{log_file_name}
+exec 3< <(tail -f -n +1 {run_folder_name}/{log_file_name})
+TAIL_PID=$!
+trap 'kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null' EXIT
+
+while true; do
+    # Drain currently-available log lines (1s timeout per blocked read).
+    while IFS= read -r -t 1 -u 3 LOGLINE; do
+        [[ "$LOGLINE" == "{chr(4)}" ]] && exit 0
+        printf '%s\\n' "$LOGLINE"
+    done
+    # No log activity for >=1s -- check whether the slurm job is still queued/running.
+    if ! squeue -h -j {jobid} 2>/dev/null | grep -q .; then
+        # Job is gone. Final drain to catch any last buffered lines, then exit.
+        while IFS= read -r -t 1 -u 3 LOGLINE; do
+            [[ "$LOGLINE" == "{chr(4)}" ]] && exit 0
+            printf '%s\\n' "$LOGLINE"
+        done
+        exit 0
+    fi
+done
+""", verbose=True, output=True)
+        machine.run_code(f"rm {run_folder_name}/pid -f")
+    elif is_os_pid and platform.system() != "Darwin":
         machine.run_code(f"touch {run_folder_name}/{log_file_name}; tail -f -n +1 --pid={pid} -f {run_folder_name}/{log_file_name}", verbose=True, output=True)
         machine.run_code(f"rm {run_folder_name}/pid -f")
     else:
-        # Runs the tail command until it sees the special character
+        # Runs the tail command until it sees the special character.
+        # `tail -f` is wired through an explicit FD so its PID is captured in
+        # $! and killed on EXIT -- otherwise, when the loop exits on EOT,
+        # tail keeps sitting in its inotify/kqueue wait and only learns the
+        # reader is gone the next time it tries to write. If the script emits
+        # nothing after EOT (no atexit / no stderr flush), tail hangs forever,
+        # ssh keeps the session up, and encap appears frozen until Ctrl-C.
+        # `-n +1` so already-finished logs are dumped fully on attach.
         machine.run_code(f"""#!/bin/bash
 touch {run_folder_name}/{log_file_name}
-while IFS= read -r LOGLINE || [[ -n "$LOGLINE" ]]; do
+exec 3< <(tail -f -n +1 {run_folder_name}/{log_file_name})
+TAIL_PID=$!
+trap 'kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null' EXIT
+while IFS= read -r -u 3 LOGLINE || [[ -n "$LOGLINE" ]]; do
     [[ "${{LOGLINE}}" == "{chr(4)}" ]] && exit 0
     printf '%s\\n' "$LOGLINE"
-done < <(tail -f {run_folder_name}/{log_file_name})
+done
 """, verbose=True, output=True)
-    
+
     machine.pull(run_folder_name, run_folder_name, directory=True)
 
 
@@ -78,7 +126,14 @@ def run(machine, file_extension, args, run_folder_name, target_file, target_file
     """
     Run the file and save outputs in log, save PID in the file pid.
     """
-    machine.push(target_file_path, target_file_path, directory=False, verbose=True)
+    # The right file is already on the remote by the time we get here:
+    #   - folder-mode fresh-run: source pushed via rsync_push in mode_run_folder
+    #   - file-mode fresh-run:   source pushed via mode_run_file's push
+    #   - rerun:                 pushed via the `if rerun:` rsync_push in mode_rerun_file
+    # An additional self-push here would, for -vm runs where the local
+    # 0encap_folder copy is a stale pull-back from a previous run, overwrite
+    # the freshly-pushed remote file with that stale copy, silently
+    # discarding the user's source edits.
 
     # Check if the files is executable, if yes then run it directly
     is_executable = os.access(target_file_path, os.X_OK)
@@ -152,7 +207,7 @@ def run(machine, file_extension, args, run_folder_name, target_file, target_file
     return pids[0], log_file_names[0]
 
 def run_slurm(machine, file_extension, target, args, run_folder_name, target_file, target_file_path, slurm_settings, interpreter_args="", name=None):
-    machine.push(target_file_path, target_file_path, directory=False, verbose=True)
+    # (Redundant self-push removed -- see comment in run() above.)
 
     # Delete previous log file and create a new one
     machine.run_code(f"""rm {run_folder_name}/pid -f
@@ -172,6 +227,11 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
         iterator = slurm_settings["i"]
     
     log_file_name = ""
+    # Capture the first instance's slurm job id and persist it as
+    # `slurm:<id>` in the pid file so `encap tail` can poll squeue and detect
+    # both normal completion (EOT marker in log) and abnormal terminations
+    # (scancel, walltime cap, OOM kill -- where no EOT is ever written).
+    first_slurm_jobid = None
     # Create the slurm script for all slurm instances
     for i in iterator:
         if i == 0:
@@ -217,7 +277,22 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
         if "sbatch: command not found" in out[0]:
             print("Error: Slurm does not seem to be installed on this machine.")
             exit(1)
-    return log_file_name
+
+        # Extract the slurm job id from sbatch's output ("Submitted batch job
+        # 12345") and persist the first instance's id as "slurm:<id>" in the
+        # pid file. tail_pull uses this to poll squeue.
+        if i == 0:
+            for line in out:
+                parts = line.strip().split()
+                if parts and parts[-1].isdigit():
+                    first_slurm_jobid = parts[-1]
+                    break
+            if first_slurm_jobid is not None:
+                machine.run_code(
+                    f"echo 'slurm:{first_slurm_jobid}' > {run_folder_name}/pid"
+                )
+
+    return log_file_name, first_slurm_jobid
 
 def get_script_name(run_folder_name, script_name):
     
@@ -287,13 +362,31 @@ def mode_run_folder(folder_name, run_folder_name, source_file_path, local_projec
 
     # Creates folder if it does not exist and checks if the caspsule already exists.
     create_folder_and_check_if_experiment_exists(machine, pargs, folder_name, run_folder_name)
-    
 
-    # Copy the local version of pargs.target to the run_folder
-    machine.push(source_file_path, run_folder_name + "/", directory=True, copy_full_dir=False, verbose=True)
+    # create_folder_and_check_if_experiment_exists only mkdirs on the remote
+    # for SSH machines. Mirror it locally so subsequent local-filesystem
+    # operations (config writes, isdir asserts) succeed in -vm mode.
+    os.makedirs(run_folder_name, exist_ok=True)
 
-    # Patch settings with all .encap.conf files
-    settings.load_encap_config_files_recursive(os.path.join(os.getcwd(), run_folder_name))
+    # Copy the local version of pargs.target to the run_folder.
+    # Use rsync_push so that (a) rsync_exclude_push is honored, (b) only
+    # changed files cross the network on subsequent runs. Trailing "/" on
+    # source_file_path mirrors the previous `copy_full_dir=False` semantics
+    # (copy contents, not the source folder itself).
+    # -fp/--force-push: drop --update and add --ignore-times to transfer
+    # regardless of mtime/size comparison.
+    machine.rsync_push(source_file_path + "/", run_folder_name + "/",
+                       directory=True, verbose=True,
+                       last_timestamp_prevails=not pargs.force_push,
+                       ignore_times=pargs.force_push,
+                       ignore=["sending incremental", "sent ", "total size"])
+
+    # Patch settings with all .encap.conf files. Walk from the *source* folder:
+    # in -vm mode the run_folder only exists on the remote, so walking from
+    # the local mirror would miss any topic-level .encap.conf entirely. The
+    # source folder has the same configs (it's what was just pushed) and is
+    # guaranteed to exist locally.
+    settings.load_encap_config_files_recursive(os.path.join(os.getcwd(), source_file_path))
 
     # Infer the proper script_name
     if "script_name" in settings.config:
@@ -301,8 +394,10 @@ def mode_run_folder(folder_name, run_folder_name, source_file_path, local_projec
     else:
         # Defaul script name is run.*
         script_name = "run.*"
-    
-    script_name = get_script_name(run_folder_name, script_name)
+
+    # Glob against the source folder for the same reason as the config walk
+    # above: the run folder may only exist on the remote in -vm mode.
+    script_name = get_script_name(source_file_path, script_name)
 
     settings.config["script_name"] = script_name
     settings.args_config["script_name"] = script_name
@@ -370,24 +465,42 @@ def mode_rerun_file(run_folder_name, local_project_dir, machine, pargs, rerun=Tr
 
     if rerun:
         machine.sync_files()
-        machine.push(target_file_path, target_file_path, directory=False, verbose=True) # TODO: The entire folder should be pushed, not just the file.
-    
+        # rsync the whole experiment dir up, not just the entry script. The
+        # previous single-file push (with a `# TODO: The entire folder should
+        # be pushed, not just the file.` comment) meant that edits to helper
+        # modules (e.g. files imported by the entry script) inside the local
+        # experiment dir never reached the remote on `encap rerun`. rsync
+        # honors rsync_exclude_push, so outputs (*.hdf5, *.pdf, etc.) aren't
+        # shipped back up; stale log files might get pushed but get truncated
+        # by encap's wrapper at job start, so no harm done.
+        machine.rsync_push(run_folder_name + "/", run_folder_name + "/",
+                           directory=True, verbose=True,
+                           last_timestamp_prevails=not pargs.force_push,
+                           ignore_times=pargs.force_push,
+                           ignore=["sending incremental", "sent ", "total size"])
+
     # Are we using slurm?
     if not settings.using_slurm:
         if "i" in settings.config:
             number_of_instances = settings.config["i"]
         else:
             number_of_instances = 1
-        
+
         pid, log_file_name = run(machine, file_extension, args, run_folder_name=run_folder_name, target_file=target_file, target_file_path=target_file_path, number_of_instances=number_of_instances)
-    
+
     else:
 
         # Load the slurm settings from the loaded config file
         slurm_settings = slurm.read_slurm_settings_from_encapconfig(pargs.vm, local_project_dir)
-        
-        # Run the SLURM job with the slurm config file
-        log_file_name = run_slurm(machine, file_extension, pargs.target, args, run_folder_name=run_folder_name, target_file=target_file, target_file_path=target_file_path, slurm_settings=slurm_settings, name=pargs.name)
+
+        # Run the SLURM job with the slurm config file. run_slurm now also
+        # returns the first instance's slurm job id; encode as "slurm:<id>"
+        # so tail_pull polls squeue rather than relying solely on the EOT
+        # marker (which never arrives if the job is killed by slurm itself,
+        # OOMs, or hits a walltime cap).
+        log_file_name, slurm_jobid = run_slurm(machine, file_extension, pargs.target, args, run_folder_name=run_folder_name, target_file=target_file, target_file_path=target_file_path, slurm_settings=slurm_settings, name=pargs.name)
+        if slurm_jobid is not None:
+            pid = f"slurm:{slurm_jobid}"
 
     machine.pull(run_folder_name, run_folder_name, directory=True)
 
@@ -420,6 +533,9 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     parser.add_argument("-cn", "--copy-name", dest="copy_name", help="Name of the experiment to copy from.", required=False, default=None)
     parser.add_argument("-a", "--args", dest="args", help="Arguments for the interpreter, for example --args ' -k 5', forming `<interpreter> <file_name> <args>`.", default=None)
     parser.add_argument("-vm", "--vm_name", dest="vm", help="Name of the Virtual Machine (VM).", default=None)
+    parser.add_argument("-fp", "--force-push", dest="force_push",
+                        action="store_true", default=False,
+                        help="Force-push local files to the remote, ignoring rsync's mtime/size short-circuit (adds --ignore-times, drops --update). Use to recover from clock skew or other sync mysteries; rsync still uses delta-transfer so unchanged bytes don't go over the wire. Has no effect without -vm.")
     parser.add_argument("-sn", "--script_name", dest="script_name", help="Specify the script file to run when a folder is targeted. Default behavior is to find a file named `run.*`.", default=None)
     parser.add_argument("-i", "--number_of_instances", dest="i", help="Specify the number of instances to initiate concurrently. Each instance will have an associated environment variable, ENCAP_PROCID=<instance_number>. This option accepts either an integer, list or a Python expression in string format. When a list is provided, instances corresponding to the list items are initiated. Examples: -i '[0, 2, 3]' or -i 'range(5, 20)'. This feature is similar to -sl_i in Slurm mode.", default=None, type=eval)
     parser.add_argument("-int", "--interpreter", dest="interpreter", help="Specify the interpreter. If not provided, it's inferred from the file extension.", default=None)
@@ -536,23 +652,29 @@ def main():
         
         
     elif pargs.mode == "tail":
+        # ignore_errors=True so a missing pid file (slurm job that already
+        # finished, or a non-slurm experiment whose pid was cleaned up by a
+        # previous tail) doesn't raise inside run_code_local before we can
+        # decide what to do.
         code = f"cat {run_folder_name}/pid"
-        out = machine.run_code(code, verbose=False, output=True)
-        
-        assert len(out) == 1, out
-        if out[0].isdigit():
-            pid = out[0]
-            print("PID: ", pid)
+        out = machine.run_code(code, verbose=False, output=True, ignore_errors=True)
 
-            machine.pull(run_folder_name, run_folder_name, directory=True)
+        pid = None
+        if len(out) == 1:
+            content = out[0].strip()
+            if content.isdigit():
+                pid = content
+                print("PID: ", pid)
+            elif content.startswith("slurm:"):
+                pid = content
+                print("Slurm Job: ", content.split(":", 1)[1])
+            # else: cat error message ("cat: ...: No such file or directory"),
+            # or some other unexpected content -- treat as no tracked process.
 
-            tail_pull(machine, run_folder_name, pid)
+        machine.pull(run_folder_name, run_folder_name, directory=True)
+        tail_pull(machine, run_folder_name, pid)
+        if pid is not None:
             remove_process_from_database(pargs.target, pargs.name)
-
-        elif  out[0][:4] == "cat:":
-                machine.pull(run_folder_name, run_folder_name, directory=True)
-
-                machine.run_code(f"cat {run_folder_name}/log", verbose=True, output=True)
 
     elif pargs.mode == "copy":
         copy_folder_name = os.path.join(folder_name, pargs.copy_name)
