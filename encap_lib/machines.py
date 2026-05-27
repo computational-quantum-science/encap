@@ -320,6 +320,26 @@ class LocalMachine(Machine):
             code = f"cp {recursiv} {self.local_project_dir}/{name_local} {self.local_project_dir}/{folder}"
             run_code_local(code, *args, **kwargs)
 
+    def rsync_push(self, name_local, name_target, directory=True,
+                   dry_run=False, last_timestamp_prevails=True,
+                   delete=False, ignore_times=False, *args, **kwargs):
+        """Local equivalent of SSHMachine.rsync_push.
+
+        For LocalMachine, source and target paths refer to the same
+        filesystem, so a 'push' is either a no-op (when source == target,
+        e.g. a local `encap rerun` where the experiment dir is already in
+        place) or a local `cp`. The rsync-only kwargs (dry_run,
+        last_timestamp_prevails, delete, ignore_times) have no analog for
+        cp and are accepted-and-ignored so callers can use a single API.
+        """
+        # rsync's trailing-slash-on-source means "copy contents, not the
+        # folder itself" -- map that to LocalMachine.push's copy_full_dir=False.
+        copy_full_dir = not name_local.endswith("/")
+        name_local = name_local.rstrip("/")
+        name_target = name_target.rstrip("/")
+        return self.push(name_local, name_target, directory=directory,
+                         copy_full_dir=copy_full_dir, *args, **kwargs)
+
     def pull(self, name_vm, name_local, directory=False, *args, **kwargs):
         pass
 
