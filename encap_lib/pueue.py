@@ -46,7 +46,7 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
     args = args.replace("{i}", f"{pueue_instance}")
         
     code = f'''#!/bin/bash
-    export ENCAP_PUEUE_INSTANCE={pueue_instance}
+    export ENCAP_NAME="{run_folder_name}"
     export ENCAP_PROCID={pueue_instance}
     cd {run_folder_name}
     
@@ -60,7 +60,6 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
 
     date &>> $log
     echo "host: $(hostname)" &>> $log
-    echo "Pueue Instance: {pueue_instance}" &>> $log
 
     echo "Encap Proc Id: $ENCAP_PROCID" &>> $log
 

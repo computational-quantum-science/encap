@@ -172,9 +172,9 @@ def run(machine, file_extension, args, run_folder_name, target_file, target_file
         if platform.system() == "Darwin":
             setsid = ''
         if is_executable:
-            run_the_experiment = f"""{setsid} nohup bash -c "time (./{target_file} {args}) 2>&1 | tee -a /dev/null" >> {log} 2>&1 &"""
+            run_the_experiment = f"""{setsid} nohup bash -c "time (./{target_file} {args}) 2>&1 | tee -a /dev/null; printf '\\004\\n'" >> {log} 2>&1 &"""
         else:
-            run_the_experiment = f"""{setsid} nohup bash -c "time ({interpreter} {interprter_args} {target_file} {args}) 2>&1 | tee -a /dev/null" >> {log} 2>&1 &"""
+            run_the_experiment = f"""{setsid} nohup bash -c "time ({interpreter} {interprter_args} {target_file} {args}) 2>&1 | tee -a /dev/null; printf '\\004\\n'" >> {log} 2>&1 &"""
         
         code = f'''
         set -e # Exit on error
