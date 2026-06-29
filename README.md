@@ -149,6 +149,17 @@ This command generates the following files:
 - my_script/test/test_data_1.p
 - my_script/test/test_data_2.p
 
+## Environment Variables
+
+When running a script, Encap automatically sets several environment variables that can be accessed from within your code:
+
+- `ENCAP_PROCID`: The ID of the parallel instance (from `0` to `i-1` when running multiple instances).
+- `ENCAP_NAME`: The version name of the current experiment (as specified by `-n`).
+- `ENCAP_JOB_NAME`: The base name of the script or folder being executed.
+- `ENCAP_SLURM_INSTANCE`: (Slurm only) The instance number of the Slurm job when launching multiple jobs via `-sl_i`.
+
+These variables allow your script to dynamically adapt its behavior based on the Encap run configuration, such as changing output file names based on the process ID or experiment version.
+
 ## More Examples
 
 Several examples can be found in the examples folder.

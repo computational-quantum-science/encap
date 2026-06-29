@@ -63,7 +63,7 @@ def generate_code_for_slurm_script(run_folder_name, slurm_settings, runslurm_fil
 
     return code
 
-def generate_slurm_executable(file_extension, run_folder_name, target_file_path, args, target_file, slurm_instance=0, ntpn=1, interpreter_args=""):
+def generate_slurm_executable(file_extension, run_folder_name, target_file_path, args, target_file, slurm_instance=0, ntpn=1, interpreter_args="", job_name=""):
     """ Generate slurm executable.
     """
     # If the interpreter has not been specified, get it from the file extension
@@ -84,6 +84,8 @@ def generate_slurm_executable(file_extension, run_folder_name, target_file_path,
     code = f'''#!/bin/bash
     export ENCAP_SLURM_INSTANCE={slurm_instance}
     export ENCAP_PROCID=$(({slurm_instance * ntpn} + $SLURM_PROCID))
+    export ENCAP_JOB_NAME="{job_name}"
+    export ENCAP_NAME="{run_folder_name}"
     cd {run_folder_name}
     
     # If $ENCAP_PROCID is 0, then the log file is called log

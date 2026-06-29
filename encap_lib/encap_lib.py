@@ -138,6 +138,15 @@ def extract_folder_name(path):
     path_split = os.path.split(path)
     return  os.path.join(*path_split[:-1]), path_split[-1]
 
+def get_job_name(target, name, instance_text, args_replace):
+    job_name = f"{target}/{name}{instance_text}"
+    if len(args_replace) > 0:
+        args_ = args_replace.replace(" ", "_")
+        if len(args_) != 0 and args_[0] == "_":
+            args_ = args_[1:]
+        job_name = f"{job_name}_{args_}"
+    return job_name
+
 def record_process(vm, name, i):
     remove_process_from_database(name, i)
 

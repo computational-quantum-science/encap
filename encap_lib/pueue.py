@@ -1,5 +1,5 @@
 import encap_lib.encap_settings as settings
-from encap_lib.encap_lib import get_interpreter_from_file_extension
+from encap_lib.encap_lib import get_interpreter_from_file_extension, get_job_name
 import sys
 import os
 import warnings
@@ -26,7 +26,7 @@ def ensure_daemon_running(machine, auto_start=True):
         print("Error: pueue daemon is not running and auto_start is disabled. Run `pueued -d`.")
         sys.exit(1)
 
-def generate_pueue_executable(file_extension, run_folder_name, target_file_path, args, target_file, pueue_instance=0, interpreter_args=""):
+def generate_pueue_executable(file_extension, run_folder_name, target_file_path, args, target_file, pueue_instance=0, interpreter_args="", job_name=""):
     """
     Generate pueue wrapper script. Mirrors slurm's generate_slurm_executable.
     """
@@ -48,6 +48,7 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
     code = f'''#!/bin/bash
     export ENCAP_NAME="{run_folder_name}"
     export ENCAP_PROCID={pueue_instance}
+    export ENCAP_JOB_NAME="{job_name}"
     cd {run_folder_name}
     
     # If $ENCAP_PROCID is 0, then the log file is called log
@@ -148,20 +149,17 @@ def run_pueue(machine, file_extension, target, args, run_folder_name, target_fil
                                  
         executable_file_name = f"{run_folder_name}/.pueue_files/run{pueue_instance_text}.sh"
         
+        args_replace = args.replace("{i}", f"{i}")
+        
+        # Define job name
+        job_name = get_job_name(target, name, pueue_instance_text, args_replace)
+            
         # Script to run the file and save outputs in log
-        code, args_replace = generate_pueue_executable(file_extension, run_folder_name, target_file_path, args, target_file=target_file, pueue_instance=i)
+        code, _ = generate_pueue_executable(file_extension, run_folder_name, target_file_path, args, target_file=target_file, pueue_instance=i, job_name=job_name)
         
         # Save the script in the run_folder
         machine.write_file(executable_file_name, code, verbose=True)
         
-        # Define job name
-        job_name = f"{target}/{name}{pueue_instance_text}"
-        if len(args_replace) > 0:
-            args_ = args_replace.replace(" ", "_")
-            if len(args_) != 0 and args_[0] == "_":
-                args_ = args_[1:]
-            job_name = f"{job_name}_{args_}"
-            
         # Add to pueue
         # We execute the bash wrapper script using pueue
         add_command = f"pueue add --label \"{job_name}\" --group \"{group}\" -- bash {executable_file_name}"
