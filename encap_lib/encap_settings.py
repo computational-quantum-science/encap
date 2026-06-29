@@ -5,7 +5,7 @@ import encap_lib
 import copy
 
 def read_terminal_arguments(pargs):
-    global args_config, config, using_slurm
+    global args_config, config, using_slurm, using_pueue
 
     slurm_conf = encap_lib.slurm.initialize_slurm_settings(pargs)
 
@@ -13,6 +13,13 @@ def read_terminal_arguments(pargs):
         args_config["slurm"] = slurm_conf
         using_slurm = True
         assert pargs.i == None, "The -i flag is not supported when using slurm."
+    
+    pueue_conf = encap_lib.pueue.initialize_pueue_settings(pargs)
+    if pueue_conf is not None:
+        args_config["pueue"] = pueue_conf
+        using_pueue = True
+        assert pargs.i == None, "The -i flag is not supported when using pueue."
+        assert not using_slurm, "Cannot use slurm and pueue at the same time."
     
     if pargs.i != None:
         if not isinstance(pargs.i, int):
@@ -118,7 +125,7 @@ running_processes_file = os.path.join(home, ".encap", "running_processes.yml")
 config_items = ["dir", "ip", "sync", "user", "ssh_ignore", "ssh_options", "sync_files",
                 "rsync_exclude", "rsync_exclude_push", "rsync_exclude_pull",
                 "project", "zone", "nfs", "machine_config",
-                "GOOGLE_APPLICATION_CREDENTIALS", "machine_config", "slurm"]
+                "GOOGLE_APPLICATION_CREDENTIALS", "machine_config", "slurm", "pueue"]
 
 default_extensions = {"py": "python -u", "sh": "bash", "jl": "julia"}
 
@@ -148,3 +155,4 @@ args_config = dict()
 debug = False
 dryrun = False
 using_slurm = False
+using_pueue = False

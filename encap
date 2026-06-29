@@ -14,6 +14,7 @@ from encap_lib.machines import LocalMachine
 from encap_lib.encap_lib import get_machine, filename_and_file_extension, get_interpreter_from_file_extension, extract_folder_name
 from encap_lib.encap_lib import record_process, remove_process_from_database
 from encap_lib import slurm
+import encap_lib.pueue
 from encap_lib.status import get_status, print_status
 import encap_lib.git_tracker as git_tracker
 
@@ -479,8 +480,12 @@ def mode_rerun_file(run_folder_name, local_project_dir, machine, pargs, rerun=Tr
                            ignore_times=pargs.force_push,
                            ignore=["sending incremental", "sent ", "total size"])
 
-    # Are we using slurm?
-    if not settings.using_slurm:
+    # Are we using slurm or pueue?
+    if settings.using_pueue:
+        pueue_settings = encap_lib.pueue.read_pueue_settings_from_encapconfig(pargs.vm, local_project_dir)
+        log_file_name = encap_lib.pueue.run_pueue(machine, file_extension, pargs.target, args, run_folder_name=run_folder_name, target_file=target_file, target_file_path=target_file_path, pueue_settings=pueue_settings, name=pargs.name)
+        
+    elif not settings.using_slurm:
         if "i" in settings.config:
             number_of_instances = settings.config["i"]
         else:
@@ -552,6 +557,11 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     parser.add_argument("-sl_nice", "--slurm_nice", dest="sl_nice", help="Nice value to run the job in slurm. Sets the priority, higer nice values equals lower priority. - nice", default=None, type=int)
     parser.add_argument("-sl_i", "--slurm_instances", dest="sl_i", help="Number of seperate slurm instances to start. If you use {i} in args it will be replaced by the index number of the slurm instance. For each instance the ENCAP_PROCID enviromental variable and the ENCAP_SLURM_INSTANCE variable will be set. If you pass a list it will run the instances in that list. Example: -sl_i [0, 2, 3] or range(5, 20)", default=None, type=eval)
     
+    # Pueue arguments
+    parser.add_argument("-pu", "--pueue", action="store_true", dest="pueue", help="Flag to run the job with Pueue. If any Pueue option is used, this flag is automatically set to True.", default=False)
+    parser.add_argument("-pu_i", "--pueue_instances", dest="pu_i", help="Number of separate pueue instances to start. If you use {i} in args it will be replaced by the index number of the pueue instance. For each instance the ENCAP_PROCID and ENCAP_PUEUE_INSTANCE variables will be set. Example: -pu_i [0, 2, 3] or range(5, 20)", default=None, type=eval)
+    parser.add_argument("-pu_pt", "--pueue_parallel_tasks", dest="pu_pt", help="Number of tasks that can run in parallel in the pueue group.", default=None, type=int)
+
     # Other arguments
     parser.add_argument("-y", "--yes",
                         action="store_true", dest="yes", default=False,

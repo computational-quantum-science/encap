@@ -3,3 +3,4 @@ __pycache__
 tests
 0encap_folder
 demo_examples
+.DS_Store

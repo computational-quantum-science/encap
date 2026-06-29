@@ -13,7 +13,7 @@ Encap currently supports:
 - Re-running old experiments
 - Tracking git repositories
 - Running multiple experiments in parallel
-- Running experiments on Slurm
+- Running experiments on a cluster with Slurm or Pueue
 - Running experiments remotely via SSH
 
 Note that Encap is currently only compatible with Linux/macOS.
@@ -256,6 +256,44 @@ slurm:
 This configuration is useful if your job needs to run for longer than the maximum time allowed by your Slurm system. The job will be run up to three times in total, including two restarts, and it is up to you to save and reload the current state of your computational experiment.
 
 In this example, `{run.sh}` and `{run.slurm}` will be replaced by encap with the actual script and Slurm file automatically upon execution.
+
+## Configuring Pueue
+
+Encap can also work with Pueue, a command-line task management tool for sequential and parallel execution of long-running tasks. To run your experiment using Pueue, execute the following command:
+
+```bash
+encap run test.py -n test -pu
+```
+
+If you want to run three experiments, use this command:
+
+```bash
+encap run test.py -n test -pu -pu_i 3
+```
+
+This command submits three different tasks to Pueue and passes the `ENCAP_PROCID` environment variable to the script. The `ENCAP_PROCID` will take the values 0, 1, 2.
+
+You can also restrict the number of tasks running in parallel for the group using `-pu_pt`:
+
+```bash
+encap run test.py -n test -pu -pu_i 3 -pu_pt 1
+```
+
+This will submit 3 tasks but only run 1 at a time.
+
+The configuration file is located at `~/.encap/config.yml`.
+
+Example config file for a Pueue job:
+
+```yml
+file_extension:
+  py: python -u
+
+pueue:
+  auto_start: true      # Encap will automatically run `pueued -d` if the daemon is not running
+  group: "default"      # The Pueue group to assign the task to
+  parallel_tasks: 2     # How many tasks can run in parallel in this group
+```
 
 ## Nesting Configuration Files
 
