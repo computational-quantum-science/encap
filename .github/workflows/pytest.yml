@@ -17,9 +17,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pytest-mock pyyaml
-        # Install any other requirements if requirements.txt exists
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install pytest pytest-mock
+        pip install .
         
     - name: Run tests
       run: |
