@@ -336,7 +336,7 @@ class LocalMachine(Machine):
         # folder itself" -- map that to LocalMachine.push's copy_full_dir=False.
         copy_full_dir = not name_local.endswith("/")
         name_local = name_local.rstrip("/")
-        name_target = name_target.rstrip("/")
+        # We don't rstrip name_target because push uses the trailing slash to determine if it should copy into the directory itself or its parent.
         return self.push(name_local, name_target, directory=directory,
                          copy_full_dir=copy_full_dir, *args, **kwargs)
 
