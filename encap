@@ -4,6 +4,9 @@ import os
 import glob
 import warnings
 import platform
+import sys
+import shlex
+import copy
 
 # name generation
 import datetime
@@ -17,6 +20,8 @@ from encap_lib import slurm
 import encap_lib.pueue
 from encap_lib.status import get_status, print_status
 import encap_lib.git_tracker as git_tracker
+from encap_lib import backends, plugin_cli, native_wait
+from encap_lib.run_preparation import write_run_configuration
 
 def tail_pull(machine, run_folder_name, pid=None, log_file_name="log"):
     # `pid` can be:
@@ -35,7 +40,7 @@ def tail_pull(machine, run_folder_name, pid=None, log_file_name="log"):
         jobid = pid.split(":", 1)[1]
         machine.run_code(f"""#!/bin/bash
 touch {run_folder_name}/{log_file_name}
-exec 3< <(tail -f -n +1 {run_folder_name}/{log_file_name})
+exec 3< <(exec tail -f -n +1 {run_folder_name}/{log_file_name})
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null' EXIT
 
@@ -71,7 +76,7 @@ done
         # `-n +1` so already-finished logs are dumped fully on attach.
         machine.run_code(f"""#!/bin/bash
 touch {run_folder_name}/{log_file_name}
-exec 3< <(tail -f -n +1 {run_folder_name}/{log_file_name})
+exec 3< <(exec tail -f -n +1 {run_folder_name}/{log_file_name})
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null' EXIT
 while IFS= read -r -u 3 LOGLINE || [[ -n "$LOGLINE" ]]; do
@@ -178,15 +183,15 @@ def run(machine, file_extension, target, args, run_folder_name, target_file, tar
         setsid = "setsid"
         if platform.system() == "Darwin":
             setsid = ''
-        if is_executable:
-            run_the_experiment = f"""{setsid} nohup bash -c "time (./{target_file} {args_replace}) 2>&1 | tee -a /dev/null; printf '\\004\\n'" >> {log} 2>&1 &"""
-        else:
-            run_the_experiment = f"""{setsid} nohup bash -c "time ({interpreter} {interprter_args} {target_file} {args_replace}) 2>&1 | tee -a /dev/null; printf '\\004\\n'" >> {log} 2>&1 &"""
+        command = f"./{target_file}" if is_executable else f"{interpreter} {interprter_args} {target_file}"
+        body = f"time ({command} {args_replace}) 2>&1 | tee -a /dev/null; " + native_wait.completion_code(i)
+        run_the_experiment = f"{setsid} nohup bash -o pipefail -c {shlex.quote(body)} >> {log} 2>&1 &"
         
         code = f'''
         set -e # Exit on error
         
         cd {run_folder_name}
+        rm -f .encap-exit{'' if i == 0 else '_' + str(i)}
         export ENCAP_PROCID={i}
         export ENCAP_NAME="{run_folder_name}"
         export ENCAP_JOB_NAME="{job_name}"
@@ -214,6 +219,8 @@ def run(machine, file_extension, target, args, run_folder_name, target_file, tar
         pids.append(pid)
         log_file_names.append(log)
 
+    native_wait.save_tracking(machine, run_folder_name, "process",
+                              [{"id": str(pid).strip(), "instance": str(i)} for pid, i in zip(pids, iterator)])
     return pids[0], log_file_names[0]
 
 def run_slurm(machine, file_extension, target, args, run_folder_name, target_file, target_file_path, slurm_settings, interpreter_args="", name=None):
@@ -242,6 +249,7 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
     # both normal completion (EOT marker in log) and abnormal terminations
     # (scancel, walltime cap, OOM kill -- where no EOT is ever written).
     first_slurm_jobid = None
+    job_ids = []
     # Create the slurm script for all slurm instances
     for i in iterator:
         if i == 0:
@@ -285,17 +293,19 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
         # Extract the slurm job id from sbatch's output ("Submitted batch job
         # 12345") and persist the first instance's id as "slurm:<id>" in the
         # pid file. tail_pull uses this to poll squeue.
-        if i == 0:
-            for line in out:
-                parts = line.strip().split()
-                if parts and parts[-1].isdigit():
+        for line in out:
+            parts = line.strip().split()
+            if parts and parts[-1].isdigit():
+                job_ids.append({"id": parts[-1], "instance": str(i)})
+                if i == 0:
                     first_slurm_jobid = parts[-1]
-                    break
-            if first_slurm_jobid is not None:
-                machine.run_code(
-                    f"echo 'slurm:{first_slurm_jobid}' > {run_folder_name}/pid"
-                )
+                break
+        else:
+            raise backends.BackendError(f"Cannot determine submitted Slurm job ID: {out}")
+        if i == 0:
+            machine.run_code(f"echo 'slurm:{first_slurm_jobid}' > {run_folder_name}/pid")
 
+    native_wait.save_tracking(machine, run_folder_name, "slurm", job_ids)
     return log_file_name, first_slurm_jobid
 
 def get_script_name(run_folder_name, script_name):
@@ -422,18 +432,6 @@ def mode_rerun_file(run_folder_name, local_project_dir, machine, pargs, rerun=Tr
     # Patch settings with all .encap.conf files
     settings.load_encap_config_files_recursive(os.path.join(os.getcwd(), run_folder_name))
 
-    # If any git-tracking is enabled, then we need to save in the config
-    if "git-track" in settings.config:
-        settings.config["git-track"] = git_tracker.get_current_commit_hashes(settings.config["git-track"])
-    
-    if "git-track-force" in settings.config:
-        settings.config["git-track-force"] = git_tracker.get_current_commit_hashes(settings.config["git-track-force"], force=True, verbose=settings.debug,
-                                                                                   commit_message=f"{run_folder_name} automatic commit from encap.")
-        
-    # Save the settings
-    settings.write_config_file(os.path.join(run_folder_name, ".encap_history.conf"), settings.config,
-                               comment="This file is automatically generated by encap. Effective encap configuration file from last run that has no effect on future runs.")
-    
     pid = None
 
     # Read settings
@@ -456,16 +454,7 @@ def mode_rerun_file(run_folder_name, local_project_dir, machine, pargs, rerun=Tr
     
     
 
-    # If .encap.conf file exists in the run_folder, load it, merge it with the comannd line arguments and save it
-    if os.path.exists(os.path.join(run_folder_name, ".encap.conf")):
-        run_folder_config = settings.read_config_file(os.path.join(run_folder_name, ".encap.conf"))
-
-        run_folder_config = settings.merge_dicts(run_folder_config, settings.args_config)
-    else:
-        run_folder_config = settings.args_config
-    
-    settings.write_config_file(os.path.join(run_folder_name, ".encap.conf"), run_folder_config,
-                               comment="This file is automatically generated by encap. This file will patch the global configuration file if the experiment is rerun.")
+    write_run_configuration(run_folder_name, settings.config, settings.args_config)
 
     if rerun:
         machine.sync_files()
@@ -524,9 +513,10 @@ def parse_arguments():
     import textwrap
 
     parser = ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("mode", help=textwrap.dedent("""The mode of the program. Either run, rerun, tail, copy, status, kill, tar or untar.
+    parser.add_argument("mode", help=textwrap.dedent("""The mode of the program. Either run, rerun, wait, tail, pull, copy, status, kill, tar or untar.
 run: Copies the target file into the experiment and runs it.
 rerun: Reruns the target file in the experiment without copying.
+wait: Waits for computation without streaming logs or pulling output.
 tail: Tails the log file of the experiment.
 copy: Copies the experiment specifeid with -cn into the experiment specified with -n.
 status: Prints the status of all the experiments running on the machine.
@@ -578,7 +568,10 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
                         action="store_true", dest="dryrun", default=False,
                         help="No command will be executed. Also implies debug.")
 
+    registrations = backends.discover()
+    backends.register_selectors(parser, registrations)
     pargs = parser.parse_args()
+    pargs.registrations = registrations
 
     # Read the data in
     if pargs.debug:
@@ -597,12 +590,14 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     else:
         assert pargs.copy_name is None, "You can only copy from a experiment in copy mode."
     
-    settings.read_terminal_arguments(pargs) 
+    pargs.base_config = copy.deepcopy(settings.config)
+    settings.read_terminal_arguments(pargs)
     return pargs
 
-def main():
-
+def _main():
     pargs = parse_arguments()
+    if plugin_cli.dispatch(pargs, pargs.registrations, get_script_name):
+        return
     local_project_dir = os.getcwd()
     localmachine = LocalMachine(local_project_dir)
 
@@ -648,7 +643,9 @@ def main():
         assert False, f"{source_file_path} is neither a directory nor a file."
     
 
-    if pargs.mode == "run":
+    if pargs.mode == "wait":
+        raise SystemExit(native_wait.wait(machine, run_folder_name))
+    elif pargs.mode == "run":
         if is_file:
             mode_run_file(folder_name=folder_name, run_folder_name=run_folder_name,
                           source_file_path=source_file_path, local_project_dir=local_project_dir, target_file_path=target_file_path,
@@ -754,6 +751,17 @@ encap rerun {pargs.target} -n {pargs.name}""")
     
     else:
         raise ValueError(f"The mode '{pargs.mode}' is not available.")
+
+
+def main():
+    try:
+        return _main()
+    except KeyboardInterrupt:
+        print("\nDetached. Remote execution has not been cancelled.", file=sys.stderr)
+        raise SystemExit(130)
+    except (backends.BackendError, OSError) as error:
+        print(f"encap: {error}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -1,29 +1,49 @@
 from datetime import datetime
 from tabulate import tabulate
 import copy
+import re
 
 def get_status(machine, run_folder_name=None, id=None):
+    is_macos = machine.run_code("uname -s")[0] == "Darwin"
     # List all the running processes that my user has
-    porcesses = machine.run_code("ps -o pid,lstart,cmd -u $USER")
+    if is_macos:
+        processes = machine.run_code('LC_ALL=C ps eww -o pid,lstart,command -U "$USER"')
+    else:
+        processes = machine.run_code('LC_ALL=C ps -ww -o pid,lstart,args -u "$USER"')
     
     # Convert into a dict with the pid as key
     process_dict = {}
-    for process in porcesses[1:]:
+    for process in processes[1:]:
         pid = process.split()[0]
         process_dict[pid] = process
     
-    # Get all the enviromental variables of the processes
-    code = ""
-    for pid in process_dict:
-        code += f"""cat /proc/{pid}/environ
+    if not process_dict:
+        return {}
+
+    if is_macos:
+        # BSD ps appends space-separated environment variables to the command.
+        envs = [
+            "\x00".join(
+                f"{name}={value}"
+                for name, value in re.findall(
+                    r"(?:^|\s)(ENCAP_[A-Za-z0-9_]+)=(.*?)(?=\s[A-Za-z_][A-Za-z0-9_]*=|$)",
+                    process,
+                )
+            )
+            for process in process_dict.values()
+        ]
+    else:
+        # Get all the environmental variables of the processes from Linux procfs.
+        code = ""
+        for pid in process_dict:
+            code += f"""cat /proc/{pid}/environ
 echo "encap_end"
 """
+        envs = machine.run_code(code)[:-1]
+        envs = "".join(envs).split("encap_end")
+        assert len(envs) == len(process_dict), f"Something went wrong {len(envs)} != {len(process_dict)}"
 
     encap_process_dict = dict()
-    envs = machine.run_code(code)[:-1]
-    envs = "".join(envs).split("encap_end")
-    assert len(envs) == len(process_dict), f"Something went wrong {len(envs)} != {len(process_dict)}"
-
     for env, pid in zip(envs, process_dict):
         if "ENCAP" in env:
             encap_process_dict[pid] = env

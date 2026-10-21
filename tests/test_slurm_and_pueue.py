@@ -27,7 +27,7 @@ def test_generate_slurm_variables():
 def test_pueue_run(mocker):
     # Mock machine
     machine = MagicMock()
-    machine.run_code.return_value = (["Success"], 0)
+    machine.run_code.side_effect = lambda command, **kwargs: (["Success"], 0) if kwargs.get("get_returncode") else ["42"]
     
     pueue_settings = {
         "group": "default"
@@ -46,10 +46,30 @@ def test_pueue_run(mocker):
     )
     
     # Check pueue add command was executed
-    pueue_command = machine.run_code.call_args_list[-1][0][0]
+    pueue_command = next(call[0][0] for call in machine.run_code.call_args_list if "pueue add" in call[0][0])
     assert "pueue add" in pueue_command
     assert '--group "default"' in pueue_command
     
     # Check script content from write_file
     script_content = machine.write_file.call_args_list[0][0][1]
     assert "python -u  run.py" in script_content
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pueue"])
+def test_scheduler_wrapper_preserves_failure(tmp_path, monkeypatch, scheduler):
+    import os
+    import subprocess
+    import sys
+    from encap_lib import encap_settings as settings
+    monkeypatch.setitem(settings.config, "interpreter", sys.executable + " -u")
+    script = tmp_path / "run.py"
+    script.write_text("import sys; print('before failure'); sys.exit(7)")
+    generate = slurm.generate_slurm_executable if scheduler == "slurm" else pueue.generate_pueue_executable
+    code, _ = generate("py", str(tmp_path), str(script), "", "run.py")
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text(code)
+    result = subprocess.run(["bash", str(wrapper)], env=dict(os.environ, SLURM_PROCID="0"), capture_output=True)
+    assert result.returncode == 7
+    log = (tmp_path / "log").read_text()
+    assert "before failure" in log
+    assert chr(4) in log

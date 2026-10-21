@@ -347,7 +347,7 @@ class LocalMachine(Machine):
         pass
 
 
-def run_code_local(command, output=True, verbose=False, wait=True, ignore_errors=False, debug=False, ignore=[], get_returncode=False):
+def run_code_local(command, output=True, verbose=False, wait=True, ignore_errors=False, debug=False, ignore=[], get_returncode=False, propagate_interrupt=False):
     if settings.debug:
         debug = True
 
@@ -368,6 +368,9 @@ def run_code_local(command, output=True, verbose=False, wait=True, ignore_errors
             retval = p.wait()
         except KeyboardInterrupt:
             p.kill()
+            if propagate_interrupt:
+                p.wait()
+                raise
             exit()
 
         if not ignore_errors and p.returncode != 0:

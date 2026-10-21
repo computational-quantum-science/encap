@@ -1,0 +1,608 @@
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import yaml
+
+from encap_lib import backends, encap_settings as settings, native_wait, plugin_cli
+from encap_lib.backends import (
+    BackendError, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
+    Registration, RunHandle, RunStatus,
+)
+
+
+def test_discovery_and_selector_collisions(monkeypatch):
+    registration = Registration("fake", Mock(), ("-fake",), plugin_version="1.0")
+    entries = Mock()
+    entries.select.return_value = [SimpleNamespace(name="fake", load=lambda: registration)]
+    monkeypatch.setattr(backends.metadata, "entry_points", lambda: entries)
+    found = backends.discover()
+    parser = argparse.ArgumentParser()
+    backends.register_selectors(parser, found)
+    assert parser.parse_args(["-fake"]).backend == "fake"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-fake", "--backend", "fake"])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-fake")
+    with pytest.raises(ConfigurationError, match="conflicts"):
+        backends.register_selectors(parser, found)
+    for registrations, message in (
+        ([registration, registration], "Duplicate backend"),
+        ([Registration("other", Mock(), ("-fake",)), registration], "duplicate plugin selector"),
+        ([Registration("fake", Mock(), api_version=999)], "Install compatible"),
+    ):
+        entries.select.return_value = [SimpleNamespace(name=item.name, load=lambda item=item: item) for item in registrations]
+        with pytest.raises(ConfigurationError, match=message):
+            backends.discover()
+
+
+@pytest.mark.parametrize("state,code,expected", [
+    ("succeeded", None, 0), ("failed", 23, 23), ("failed", 0, 1),
+    ("failed", 300, 1), ("failed", True, 1), ("cancelled", None, 130),
+])
+def test_wait_terminal_states(state, code, expected):
+    backend = Mock()
+    backend.status.side_effect = [RunStatus("running"), RunStatus(state, code)]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backends.time, "sleep", lambda interval: None)
+        assert backends.exit_code(backends.wait(backend, RunHandle({}))) == expected
+    backend.pull.assert_not_called()
+    backend.tail.assert_not_called()
+    backend.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [RunStatus("unknown"), RunStatus("succeeded", outputs_finalized=False)])
+def test_wait_never_infers_success(status):
+    backend = Mock()
+    backend.status.return_value = status
+    with pytest.raises(MonitoringError):
+        backends.wait(backend, RunHandle({}))
+
+
+def test_wait_interrupt_and_connection_error():
+    backend = Mock()
+    for error in (KeyboardInterrupt(), MonitoringError("offline")):
+        backend.status.side_effect = error
+        with pytest.raises(type(error)):
+            backends.wait(backend, RunHandle({}))
+    backend.cancel.assert_not_called()
+
+
+def test_records_are_versioned_atomic_and_recoverable(tmp_path):
+    registration = Registration("fake", Mock(), plugin_version="2")
+    destination = tmp_path / "run"
+    writer = RecordWriter.reserve(destination, registration, "run")
+    assert writer.read()["state"] == "submission-unconfirmed"
+    handle = RunHandle({"request_id": "pre-submission-recovery"})
+    writer.save_handle(handle)
+    reconnected = RecordWriter(writer.directory)
+    assert reconnected.read()["handle"]["data"] == handle.data
+    assert not list(writer.directory.glob("*.tmp"))
+    with pytest.raises(BackendError, match="already exists"):
+        RecordWriter.reserve(destination, registration, "run")
+    with pytest.raises(BackendError, match="JSON"):
+        writer.save_handle(RunHandle({"invalid": object()}))
+    assert reconnected.read()["handle"]["data"] == handle.data
+    writer.update(record_version=999)
+    with pytest.raises(BackendError, match="Incompatible"):
+        writer.read()
+
+
+def test_config_origins_survive_merge(tmp_path, monkeypatch):
+    parent = tmp_path / ".encap.conf"
+    child_dir = tmp_path / "experiment"
+    child_dir.mkdir()
+    child = child_dir / ".encap.conf"
+    parent.write_text("backend: fake\nplugins:\n  fake:\n    input: data\n    other: original\n")
+    child.write_text("plugins:\n  fake:\n    other: changed\n")
+    monkeypatch.setattr(settings, "config", {})
+    monkeypatch.setattr(settings, "args_config", {})
+    settings.load_encap_config_files_recursive(str(child_dir))
+    namespace = settings.config["plugins"]["fake"]
+    assert namespace.resolve_path("input") == tmp_path / "data"
+    assert namespace.resolve_path("other") == child_dir / "changed"
+    settings.write_config_file(str(tmp_path / "snapshot"), settings.config)
+    assert "python/object" not in (tmp_path / "snapshot").read_text()
+
+
+def load_cli():
+    path = Path(__file__).resolve().parents[1] / "encap"
+    loader = importlib.machinery.SourceFileLoader("encap_plugin_test_cli", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def cli(tmp_path, monkeypatch):
+    cli = load_cli()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "config", {"file_extension": {"py": "python -u"}})
+    monkeypatch.setattr(settings, "args_config", {})
+    monkeypatch.setattr(settings, "using_slurm", False)
+    monkeypatch.setattr(settings, "using_pueue", False)
+    factory = Mock()
+    backend = factory.return_value
+    backend.submit.return_value = RunHandle({"operation": "123"})
+    registration = Registration("fake", factory, ("-fake",), instance_selectors=("-fake_i",))
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    monkeypatch.setattr(cli, "get_machine", Mock(side_effect=AssertionError("must not construct machine")))
+    monkeypatch.setattr(cli, "LocalMachine", Mock(side_effect=AssertionError("must not construct machine")))
+    (tmp_path / "experiment").mkdir()
+    (tmp_path / "experiment" / "run.py").write_text("print('hello')")
+    return cli, factory, backend
+
+
+def invoke(cli, monkeypatch, *arguments):
+    monkeypatch.setattr(sys, "argv", ["encap", *arguments])
+    return cli.main()
+
+
+def test_plugin_lifecycle_uses_saved_handle(cli, tmp_path, monkeypatch, capsys):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    bucket: original\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake", "-a", '--value "two words"')
+    assert factory.call_args.args[0] == {"bucket": "original"}
+    request = backend.submit.call_args.args[0]
+    assert request.arguments == ["--value", "two words"]
+    assert request.entrypoint == "run.py"
+    assert request.run_folder == tmp_path / "0encap_folder" / "experiment" / "trial"
+    assert (request.run_folder / "run.py").read_text() == "print('hello')"
+    assert (request.run_folder / ".encap.conf").is_file()
+    assert (request.run_folder / ".encap_history.conf").is_file()
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    assert request.record_dir == destination / ".encap-run"
+    backend.tail.assert_called_once_with(RunHandle({"operation": "123"}))
+    backend.pull.assert_called_once_with(RunHandle({"operation": "123"}), destination)
+    # Reconnect must work without even parsing changed/broken provider config or source.
+    (tmp_path / "experiment" / ".encap.conf").write_text("not: [valid")
+    backend.status.return_value = RunStatus("succeeded", outputs_finalized=True, cleanup_pending=True)
+    for command in ("tail", "pull", "status", "kill"):
+        invoke(module, monkeypatch, command, "experiment", "-n", "trial")
+    assert factory.call_args.args[0] == {}
+    assert backend.pull.call_count == 3
+    backend.pull.assert_called_with(RunHandle({"operation": "123"}), destination)
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "wait", "experiment", "-n", "trial")
+    assert result.value.code == 0
+    assert "cleanup is still pending" in capsys.readouterr().out
+    backend.status.return_value = RunStatus("running")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+
+
+@pytest.mark.parametrize("flag", ["-vm", "-sl", "-pu", "-i", "-dr", "-fp"])
+def test_plugin_conflicting_native_options(cli, monkeypatch, flag):
+    module, factory, backend = cli
+    extra = {"-vm": ["host"], "-i": ["2"]}.get(flag, [])
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake", flag, *extra)
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("4", 4), ("[0, 2, 3]", [0, 2, 3]), ("range(2, 5)", [2, 3, 4]),
+    ("range(4)", [0, 1, 2, 3]), ("range(1, 6, 2)", [1, 3, 5]), ("[7]", [7]),
+])
+def test_plugin_instance_selector_reaches_submit(cli, monkeypatch, text, expected):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", text)
+    request = backend.submit.call_args.args[0]
+    assert request.instances == expected
+    assert yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())["backend_instances"] == expected
+
+
+@pytest.mark.parametrize("text", ["0", "-2", "[]", "[1, 1]", "[True]", "[1.2]", "range(0)", "range(1, 3, 0)"])
+def test_invalid_plugin_instances_never_submit(cli, monkeypatch, text):
+    module, factory, backend = cli
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", text)
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+
+
+def test_plugin_instance_selector_rejects_native_i(cli, monkeypatch):
+    module, factory, backend = cli
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", "4", "-i", "2")
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+
+
+def test_plugin_configured_instances_reach_submit(cli, monkeypatch, tmp_path):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\nbackend_instances: [2, 5]\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    assert backend.submit.call_args.args[0].instances == [2, 5]
+
+
+def test_uncertain_submission_preserves_intent(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    def submit(request, writer):
+        writer.save_handle(RunHandle({"request_id": "known-before-request"}))
+        raise MonitoringError("response lost")
+    backend.submit.side_effect = submit
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    writer = RecordWriter(tmp_path / "0encap_folder" / "experiment" / "trial" / ".encap-run")
+    assert writer.read()["state"] == "submission-unconfirmed"
+    invoke(module, monkeypatch, "tail", "experiment", "-n", "trial")
+    backend.tail.assert_called_once_with(RunHandle({"request_id": "known-before-request"}))
+    assert backend.submit.call_count == 1
+
+
+def test_missing_plugin_and_unsupported_mode(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("backend: missing\n")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\n")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+
+
+@pytest.mark.parametrize("kind,state,expected", [
+    ("slurm", "7|COMPLETED|0:0", 0), ("slurm", "7|FAILED|4:0", 4),
+    ("slurm", "7|CANCELLED by 1|0:15", 130), ("slurm", "7|OUT_OF_MEMORY|0:9", 137),
+    ("pueue", {"Done": {"result": "Success"}}, 0),
+    ("pueue", {"Done": {"result": {"Failed": 8}}}, 8),
+    ("pueue", {"Done": {"result": "Killed"}}, 130),
+    ("process", "0", 0), ("process", "19", 19),
+])
+def test_native_wait_actual_completion_mechanisms(kind, state, expected):
+    machine = Mock()
+    tracking = json.dumps({"version": 1, "kind": kind, "identifiers": [{"id": "7", "instance": "0"}]})
+    response = json.dumps({"tasks": {"7": {"status": state}}}) if kind == "pueue" else state
+    machine.run_code.side_effect = [([tracking], 0), ([response], 0)]
+    assert native_wait.wait(machine, "experiment") == expected
+    if kind == "slurm":
+        assert "sacct -j 7" in machine.run_code.call_args.args[0]
+    elif kind == "pueue":
+        assert machine.run_code.call_args.args[0] == "pueue status --json"
+    else:
+        assert "kill -0 7" in machine.run_code.call_args.args[0]
+    assert all("tail" not in call.args[0] for call in machine.run_code.call_args_list)
+
+
+@pytest.mark.parametrize("result", ["unknown", "garbage"])
+def test_native_wait_disappearance_is_not_success(result):
+    machine = Mock()
+    machine.run_code.side_effect = [
+        ([json.dumps({"version": 1, "kind": "process", "identifiers": [{"id": "9", "instance": "0"}]})], 0),
+        ([result], 0),
+    ]
+    with pytest.raises(MonitoringError):
+        native_wait.wait(machine, "run")
+
+
+def test_project_global_namespace_precedes_experiment_config(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    global_file = tmp_path / "global.yml"
+    global_file.write_text(
+        f"projects:\n  {tmp_path}:\n    backend: fake\n    plugins:\n      fake:\n        input: global-data\n        value: global\n"
+    )
+    settings.config = settings.read_config_file(str(global_file))
+    (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    value: experiment\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    namespace = factory.call_args.args[0]
+    assert namespace["value"] == "experiment"
+    assert namespace.resolve_path("input") == tmp_path / "global-data"
+
+
+def test_reconnect_after_source_removed_and_monitoring_error(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    (tmp_path / "experiment" / "run.py").unlink()
+    (tmp_path / "experiment").rmdir()
+    backend.status.side_effect = MonitoringError("connection unavailable")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "wait", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    record = RecordWriter(tmp_path / "0encap_folder" / "experiment" / "trial" / ".encap-run").read()
+    assert record["monitoring_error"] == "connection unavailable"
+    assert record["state"] == "submitted"
+    backend.cancel.assert_not_called()
+
+
+def test_cli_wait_interrupt_never_cancels(cli, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    backend.status.side_effect = KeyboardInterrupt
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "wait", "experiment", "-n", "trial")
+    assert result.value.code == 130
+    backend.cancel.assert_not_called()
+
+
+def test_native_wait_scheduler_missing_or_offline_is_error():
+    tracking = json.dumps({"version": 1, "kind": "slurm", "identifiers": [{"id": "7", "instance": "0"}]})
+    machine = Mock()
+    machine.run_code.side_effect = [([tracking], 0), ([], 0), ([], 0)]
+    with pytest.raises(MonitoringError, match="absent"):
+        native_wait.wait(machine, "run")
+    machine.run_code.side_effect = [([tracking], 0), (["ssh connection lost"], 255)]
+    with pytest.raises(MonitoringError, match="connection lost"):
+        native_wait.wait(machine, "run")
+
+
+def test_native_pueue_wait_handles_modern_queued_status(monkeypatch):
+    tracking = json.dumps({"version": 1, "kind": "pueue", "identifiers": [{"id": "7", "instance": "0"}]})
+    machine = Mock()
+    machine.run_code.side_effect = [
+        ([tracking], 0),
+        ([json.dumps({"tasks": {"7": {"status": {"Queued": {"enqueued_at": "now"}}}}})], 0),
+        ([json.dumps({"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}})], 0),
+    ]
+    monkeypatch.setattr(native_wait.time, "sleep", Mock())
+    assert native_wait.wait(machine, "run") == 0
+    native_wait.time.sleep.assert_called_once()
+
+
+@pytest.mark.parametrize("configuration", [
+    "i: 4\n", "environment:\n  INVALID=NAME: value\n", "script_name: missing.py\n",
+])
+def test_invalid_plugin_request_rejected_before_submission(cli, tmp_path, monkeypatch, configuration):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text(configuration)
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+
+
+def test_saved_record_with_missing_plugin_is_actionable(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    backend.tail.reset_mock()
+    monkeypatch.setattr(backends, "discover", lambda: {})
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "tail", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    backend.tail.assert_not_called()
+
+
+@pytest.mark.parametrize("error,expected_code", [
+    (KeyboardInterrupt(), 130), (MonitoringError("log connection lost"), 2),
+])
+def test_run_tails_only_after_confirmed_record_and_preserves_submission(cli, tmp_path, monkeypatch, error, expected_code):
+    module, factory, backend = cli
+    writer = RecordWriter(tmp_path / "0encap_folder" / "experiment" / "trial" / ".encap-run")
+    def tail(handle):
+        record = writer.read()
+        assert record["state"] == "submitted"
+        assert record["handle"]["data"] == handle.data
+        raise error
+    backend.tail.side_effect = tail
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == expected_code
+    record = writer.read()
+    assert record["state"] == "submitted"
+    assert "submission_error" not in record
+    if isinstance(error, MonitoringError):
+        assert record["monitoring_error"] == "log connection lost"
+    backend.cancel.assert_not_called()
+    backend.pull.assert_not_called()
+    backend.submit.assert_called_once()
+
+
+@pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled"])
+@pytest.mark.parametrize("automatic", [False, True])
+def test_overwrite_finished_run_preserves_old_record_and_outputs(cli, tmp_path, monkeypatch, state, automatic):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    (destination / "result.txt").write_text("old output")
+    backend.status.return_value = RunStatus(state)
+    backend.submit.return_value = RunHandle({"operation": "new"})
+    prompt = Mock(return_value="y")
+    monkeypatch.setattr("builtins.input", prompt)
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", *(["-y"] if automatic else []))
+    assert prompt.call_count == (0 if automatic else 1)
+    backups = list(destination.parent.glob("trial.backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "result.txt").read_text() == "old output"
+    assert RecordWriter(backups[0] / ".encap-run").read()["handle"]["data"] == {"operation": "123"}
+    assert RecordWriter(destination / ".encap-run").read()["handle"]["data"] == {"operation": "new"}
+    assert backend.submit.call_count == 2
+    backend.cancel.assert_not_called()
+    assert backend.pull.call_count == 2
+
+
+def test_declining_overwrite_preserves_existing_run(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    backend.status.return_value = RunStatus("failed")
+    monkeypatch.setattr("builtins.input", Mock(return_value="n"))
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    assert backend.submit.call_count == 1
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    assert destination.exists()
+    assert not list(destination.parent.glob("trial.backup-*"))
+
+
+@pytest.mark.parametrize("state", ["submitted", "running", "unknown", "unconfirmed", "offline"])
+def test_unsafe_overwrite_is_rejected_even_with_yes(cli, tmp_path, monkeypatch, state):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    if state == "unconfirmed":
+        RecordWriter(destination / ".encap-run").update(state="submission-unconfirmed")
+    elif state == "offline":
+        backend.status.side_effect = MonitoringError("offline")
+    else:
+        backend.status.return_value = RunStatus(state)
+    prompt = Mock(side_effect=AssertionError("must not prompt"))
+    monkeypatch.setattr("builtins.input", prompt)
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-y")
+    assert result.value.code == 2
+    assert backend.submit.call_count == 1
+    assert destination.exists()
+    assert not list(destination.parent.glob("trial.backup-*"))
+    backend.cancel.assert_not_called()
+
+
+def test_overwrite_detects_changed_record_before_renaming(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    backend.status.return_value = RunStatus("failed")
+    def confirm(message):
+        RecordWriter(destination / ".encap-run").update(state="submission-unconfirmed")
+        return "y"
+    monkeypatch.setattr("builtins.input", confirm)
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    assert backend.submit.call_count == 1
+    assert destination.exists()
+    assert not list(destination.parent.glob("trial.backup-*"))
+
+
+@pytest.mark.parametrize("mode", ["run", "tail"])
+def test_auto_pull_follows_tail_and_surfaces_download_failure(cli, tmp_path, monkeypatch, mode):
+    module, factory, backend = cli
+    if mode == "tail":
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+        backend.reset_mock()
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    def pull(handle, target):
+        backend.tail.assert_called_once_with(handle)
+        assert target == destination
+        assert RecordWriter(target / ".encap-run").read()["state"] == "submitted"
+        raise MonitoringError("download unavailable")
+    backend.pull.side_effect = pull
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, mode, "experiment", "-n", "trial", *(["-fake"] if mode == "run" else []))
+    assert result.value.code == 2
+    record = RecordWriter(destination / ".encap-run").read()
+    assert record["monitoring_error"] == "download unavailable"
+    assert "submission_error" not in record
+    backend.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), MonitoringError("log connection lost")])
+def test_reattached_tail_skips_pull_when_interrupted_or_failed(cli, monkeypatch, error):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    backend.pull.reset_mock()
+    backend.tail.side_effect = error
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "tail", "experiment", "-n", "trial")
+    assert result.value.code == (130 if isinstance(error, KeyboardInterrupt) else 2)
+    backend.pull.assert_not_called()
+    backend.cancel.assert_not_called()
+
+
+def test_wait_does_not_auto_pull_after_submission(cli, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    backend.pull.reset_mock()
+    backend.tail.reset_mock()
+    backend.status.return_value = RunStatus("succeeded")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "wait", "experiment", "-n", "trial")
+    assert result.value.code == 0
+    backend.pull.assert_not_called()
+    backend.tail.assert_not_called()
+
+
+@pytest.mark.parametrize("file_mode", [False, True])
+def test_submit_receives_prepared_run_folder_and_configuration(cli, tmp_path, monkeypatch, file_mode):
+    module, factory, backend = cli
+    source = tmp_path / "experiment"
+    (source / "helper.py").write_text("VALUE = 42\n")
+    (source / ".encap.conf").write_text("args: '--value configured'\nplugins:\n  fake:\n    bucket: original\n")
+    original = (source / ".encap.conf").read_text()
+    target = "experiment/run.py" if file_mode else "experiment"
+    expected = source / "run" / "trial" if file_mode else tmp_path / "0encap_folder" / "experiment" / "trial"
+    def submit(request, writer):
+        assert request.run_folder == expected
+        assert request.record_dir == expected / ".encap-run"
+        assert not hasattr(request, "source_dir")
+        assert not hasattr(request, "source_files")
+        assert not hasattr(request, "exclude")
+        assert (expected / "run.py").read_text() == "print('hello')"
+        assert (expected / "helper.py").exists() is (not file_mode)
+        config = yaml.safe_load((expected / ".encap.conf").read_text())
+        history = yaml.safe_load((expected / ".encap_history.conf").read_text())
+        assert config["backend"] == history["backend"] == "fake"
+        assert config["script_name"] == history["script_name"] == request.entrypoint == "run.py"
+        assert config["args"] == history["args"] == "--value command-line"
+        assert history["plugins"]["fake"]["bucket"] == "original"
+        assert writer.read()["api_version"] == 2
+        return RunHandle({"operation": "prepared"})
+    backend.submit.side_effect = submit
+    invoke(module, monkeypatch, "run", target, "-n", "trial", "-fake", "-a", "--value command-line")
+    assert (source / ".encap.conf").read_text() == original
+
+
+def test_staging_applies_exclusions_and_never_copies_remote_records(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    source = tmp_path / "experiment"
+    (source / ".encap.conf").write_text("rsync_exclude_push: ['*.large', scratch/]\n")
+    (source / "input.large").write_text("not staged")
+    (source / "scratch").mkdir()
+    (source / "scratch" / "data").touch()
+    (source / ".encap-run").mkdir()
+    (source / ".encap-run" / "private").write_text("not source")
+    (source / "nested").mkdir()
+    (source / "nested" / "empty").touch()
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    staged = backend.submit.call_args.args[0].run_folder
+    assert not (staged / "input.large").exists()
+    assert not (staged / "scratch").exists()
+    assert not (staged / ".encap-run" / "private").exists()
+    assert (staged / "nested" / "empty").stat().st_size == 0
+
+
+def test_git_tracking_is_resolved_before_plugin_submit(cli, tmp_path, monkeypatch):
+    from encap_lib import run_preparation
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("git-track: ['tracked-repo']\n")
+    tracker = Mock(return_value={"tracked-repo": "commit-hash"})
+    monkeypatch.setattr(run_preparation.git_tracker, "get_current_commit_hashes", tracker)
+    def submit(request, writer):
+        tracker.assert_called_once_with(["tracked-repo"])
+        history = yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())
+        assert history["git-track"] == {"tracked-repo": "commit-hash"}
+        return RunHandle({})
+    backend.submit.side_effect = submit
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+
+
+def test_preparation_failure_never_submits(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / "link").symlink_to(tmp_path / "experiment" / "run.py")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+    backend.tail.assert_not_called()
+
+
+def test_api_one_saved_runs_remain_manageable(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    writer = RecordWriter(tmp_path / "0encap_folder" / "experiment" / "trial" / ".encap-run")
+    writer.update(api_version=1)
+    backend.status.return_value = RunStatus("succeeded")
+    invoke(module, monkeypatch, "status", "experiment", "-n", "trial")
+    assert writer.read()["api_version"] == 1
+    backend.status.assert_called_once_with(RunHandle({"operation": "123"}))

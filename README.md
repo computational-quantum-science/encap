@@ -6,6 +6,8 @@
 
 Encap is a user-friendly tool designed to help you manage and keep track of your computational experiments, especially in the field of scientific computing. With Encap, you can easily run various experiments in separate containers and maintain a record of the results.
 
+Want to add an execution backend? See the brief [plugin author guide](PLUGIN_README.md).
+
 ## Features
 
 Encap currently supports:
@@ -95,6 +97,24 @@ pip install encap
 encap -h
 ```
 
+## Command Overview
+
+| Command | Description |
+| --- | --- |
+| `encap run` | Copy the source into a new experiment and run it. |
+| `encap rerun` | Re-run an existing experiment without copying the source again. |
+| `encap wait` | Wait for an experiment to finish without streaming logs or downloading outputs. |
+| `encap tail` | Follow an experiment's log. |
+| `encap copy` | Copy the experiment named with `-cn` into the experiment named with `-n`. |
+| `encap status` | List running experiments for the current user, locally or with `-vm <machine_name>` on a remote machine. For plugin runs, specify the target and `-n` to show the saved run's status. |
+| `encap kill` | Stop a running experiment. |
+| `encap pull` | Download an experiment's files from the remote machine or execution backend. |
+| `encap push` | Upload an experiment's files to the remote machine. |
+| `encap tar` | Archive an experiment, or all experiments for the target if `-n` is omitted. |
+| `encap untar` | Extract an experiment archive, or all archives for the target if `-n` is omitted. |
+| `encap -h` | Show command-line help and available options. |
+
+
 ## Re-running a Previous Experiment
 
 To re-run a previous experiment, use Encap in rerun mode:
@@ -116,6 +136,11 @@ encap tail scripts/my_script.py -n test
 This streams the log in real time and exits cleanly when the experiment finishes — either when the script writes its end-of-transmission marker on normal exit, or, for Slurm jobs, when the job leaves the queue (so `scancel`, walltime kills, and OOMs are detected too). For experiments that have already completed, the full log is dumped once and `encap tail` returns.
 
 Combine with `-vm <machine_name>` to follow a remote job.
+
+## Execution plugins
+
+For plugin installation, configuration, commands and waiting behavior, see
+[Execution plugins and waiting](PLUGIN_README.md#execution-plugins-and-waiting).
 
 ## Running Multiple Experiments in Parallel
 

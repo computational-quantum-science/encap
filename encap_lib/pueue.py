@@ -3,6 +3,8 @@ from encap_lib.encap_lib import get_interpreter_from_file_extension, get_job_nam
 import sys
 import os
 import warnings
+from encap_lib import native_wait
+from encap_lib.backends import BackendError
 
 def ensure_daemon_running(machine, auto_start=True):
     """
@@ -35,13 +37,13 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
 
     # Chech if the files is executable, if yes then run it directly
     if os.access(target_file_path, os.X_OK):
-        run_the_experiment = f"""bash -c "time ./{target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
+        run_the_experiment = f"""bash -o pipefail -c "time ./{target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
 
         # Give warning if an interpreter is set in the settings file
         if "interpreter" in settings.config:
             warnings.warn(f"WARNING: 'interpreter' is set in the settings files, but your file is executable. The interpreter in the (settings file)/(command line) will be ignored.", UserWarning)
     else:
-        run_the_experiment = f"""bash -c "time {interpreter} {interpreter_args} {target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
+        run_the_experiment = f"""bash -o pipefail -c "time {interpreter} {interpreter_args} {target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
 
     args = args.replace("{i}", f"{pueue_instance}")
         
@@ -68,7 +70,9 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
     echo "{target_file_path} {args}" &>> $log
     echo "" &>> $log
     {run_the_experiment}
+    encap_result=$?
     echo {chr(4)} &>> $log
+    exit "$encap_result"
     '''
     return code, args
 
@@ -137,6 +141,7 @@ def run_pueue(machine, file_extension, target, args, run_folder_name, target_fil
     if "parallel_tasks" in pueue_settings:
         machine.run_code(f"pueue parallel {pueue_settings['parallel_tasks']} -g {group}")
         
+    task_ids = []
     for i in iterator:
         if i == 0:
             pueue_instance_text = ""
@@ -163,9 +168,12 @@ def run_pueue(machine, file_extension, target, args, run_folder_name, target_fil
         
         # Add to pueue
         # We execute the bash wrapper script using pueue
-        add_command = f"pueue add --label \"{job_name}\" --group \"{group}\" -- bash {executable_file_name}"
-        machine.run_code(add_command, verbose=True)
+        add_command = f"pueue add --print-task-id --label \"{job_name}\" --group \"{group}\" -- bash {executable_file_name}"
+        out = machine.run_code(add_command, verbose=True)
+        if len(out) != 1 or not out[0].strip().isdigit():
+            raise BackendError(f"Cannot determine submitted Pueue task ID: {out}")
+        task_ids.append({"id": out[0].strip(), "instance": str(i)})
         
-    # We don't save a PID in the pid file because `encap tail` will just wait for chr(4).
+    native_wait.save_tracking(machine, run_folder_name, "pueue", task_ids)
     # Return the log file name.
     return log_file_name

@@ -71,13 +71,13 @@ def generate_slurm_executable(file_extension, run_folder_name, target_file_path,
 
     # Chech if the files is executable, if yes then run it directly
     if os.access(target_file_path, os.X_OK):
-        run_the_experiment = f"""bash -c "time ./{target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
+        run_the_experiment = f"""bash -o pipefail -c "time ./{target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
 
         # Give warning if an interpreter is set in the settings file
         if "interpreter" in settings.config:
             warnings.warn(f"WARNING: 'interpreter' is set in the settings files, but your file is executable. The interpreter in the (settings file)/(command line) will be ignored.", UserWarning)
     else:
-        run_the_experiment = f"""bash -c "time {interpreter} {interpreter_args} {target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
+        run_the_experiment = f"""bash -o pipefail -c "time {interpreter} {interpreter_args} {target_file} {args} 2>&1 | tee -a /dev/null" &>> $log"""
 
     args = args.replace("{i}", f"{slurm_instance}")
         
@@ -114,7 +114,9 @@ def generate_slurm_executable(file_extension, run_folder_name, target_file_path,
     echo "" &>> $log
     #(time {interpreter} {target_file} {args}) &>> $log && echo {chr(4)} &>> $log without tee for unbuffered output
     {run_the_experiment}
+    encap_result=$?
     echo {chr(4)} &>> $log
+    exit "$encap_result"
     '''
     return code, args
 

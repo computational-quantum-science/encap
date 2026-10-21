@@ -3,6 +3,8 @@ import yaml
 import sys
 import encap_lib
 import copy
+from pathlib import Path
+from encap_lib.backends import ConfigurationError, PluginConfig
 
 def read_terminal_arguments(pargs):
     global args_config, config, using_slurm, using_pueue
@@ -12,14 +14,17 @@ def read_terminal_arguments(pargs):
     if slurm_conf is not None:
         args_config["slurm"] = slurm_conf
         using_slurm = True
-        assert pargs.i == None, "The -i flag is not supported when using slurm."
+        if pargs.i is not None:
+            raise ConfigurationError("The -i flag is not supported when using slurm.")
     
     pueue_conf = encap_lib.pueue.initialize_pueue_settings(pargs)
     if pueue_conf is not None:
         args_config["pueue"] = pueue_conf
         using_pueue = True
-        assert pargs.i == None, "The -i flag is not supported when using pueue."
-        assert not using_slurm, "Cannot use slurm and pueue at the same time."
+        if pargs.i is not None:
+            raise ConfigurationError("The -i flag is not supported when using pueue.")
+        if using_slurm:
+            raise ConfigurationError("Cannot use slurm and pueue at the same time.")
     
     if pargs.i != None:
         if not isinstance(pargs.i, int):
@@ -50,7 +55,20 @@ def read_config_file(file_name):
             sys.exit(exc)
     if config_ is None:
         config_ = dict()
-    
+    if not isinstance(config_, dict):
+        raise ConfigurationError(f"{file_name}: configuration must be a mapping")
+    def plugin_namespaces(mapping):
+        for key, value in list(mapping.items()):
+            if key == "plugins":
+                if not isinstance(value, dict) or any(not isinstance(namespace, dict) for namespace in value.values()):
+                    raise ConfigurationError(f"{file_name}: plugins must contain configuration mappings")
+                mapping[key] = {
+                    name: PluginConfig(namespace, str(Path(file_name).resolve().parent))
+                    for name, namespace in value.items()
+                }
+            elif isinstance(value, dict):
+                plugin_namespaces(value)
+    plugin_namespaces(config_)
     return config_
 
 def write_config_file(file_name, settings, comment=""):
@@ -72,7 +90,7 @@ def find_encap_config_files(path):
         
     return config_file_names[::-1]
 
-def load_encap_config_files_recursive(path):
+def load_encap_config_files_recursive(path, overrides=None):
     """Load all .encap files in parent directories"""
     global config, args_config
 
@@ -82,7 +100,7 @@ def load_encap_config_files_recursive(path):
         config = merge_dicts(config, config_patch)
     
     # Reload config with command line arguments in case they overwrite config file settings
-    merge_dicts(config, copy.deepcopy(args_config))
+    merge_dicts(config, copy.deepcopy(args_config if overrides is None else overrides))
 
 def merge_dicts(dict1, dict2):
     """Merge two dictionaries"""
@@ -91,7 +109,11 @@ def merge_dicts(dict1, dict2):
             merge_dicts(dict1[k], dict2[k])
         else:
             dict1[k] = dict2[k]
+            if isinstance(dict1, PluginConfig) and isinstance(dict2, PluginConfig):
+                dict1.origins[k] = dict2.origins.get(k)
     return dict1
+
+yaml.add_representer(PluginConfig, lambda dumper, value: dumper.represent_dict(value))
 
 def get_item(item, config_location):
     global config

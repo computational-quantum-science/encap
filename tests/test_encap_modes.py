@@ -82,3 +82,22 @@ def test_folder_mode(tmp_path, mocker, monkeypatch):
     log_file = run_folder / "log"
     assert log_file.exists()
     assert "hello from folder mode" in log_file.read_text()
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_local_wait_preserves_real_exit_code(tmp_path, mocker, monkeypatch, code):
+    encap = load_encap(tmp_path)
+    mocker.patch.object(encap, 'tail_pull', return_value=None)
+    test_script = tmp_path / "wait_script.py"
+    test_script.write_text(f"import sys; print('finished'); sys.exit({code})")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["encap", "run", "wait_script.py", "-n", "trial"])
+    encap.main()
+    from encap_lib import native_wait
+    original_wait = native_wait.wait
+    mocker.patch.object(native_wait, "wait", side_effect=lambda machine, folder: original_wait(machine, folder, interval=0.01))
+    monkeypatch.setattr(sys, "argv", ["encap", "wait", "wait_script.py", "-n", "trial"])
+    with pytest.raises(SystemExit) as result:
+        encap.main()
+    assert result.value.code == code
+    assert (tmp_path / "wait_script" / "trial" / ".encap-exit").read_text().strip() == str(code)
