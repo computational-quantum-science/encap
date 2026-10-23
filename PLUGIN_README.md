@@ -18,8 +18,8 @@ encap pull ./experiment -n trial
 encap kill ./experiment -n trial
 ```
 
-Backends can register an instance selector, such as Dataproc's `-gcp_i`.
-Like `-sl_i`, it accepts a count, explicit IDs or a range:
+Backends can register their own CLI options. For example, Dataproc owns
+`-gcp_i`; like Slurm's `-sl_i`, it accepts a count, explicit IDs or a range:
 
 ```sh
 encap run ./experiment -n trial -gcp_i 4
@@ -27,16 +27,15 @@ encap run ./experiment -n selected -gcp_i '[0, 2, 7]'
 encap run ./experiment -n ranged -gcp_i 'range(2, 5)'
 ```
 
-An instance selector also selects its backend; `-gcp` is optional with `-gcp_i`.
-The default is one instance (ID 0). `backend_instances` in the existing
-configuration hierarchy provides a default count or list; the explicit selector
-overrides it. IDs must be unique nonnegative integers and counts must be positive.
-As with Slurm, `-i` cannot be combined with this backend.
-Dataproc submits one independent workflow/machine per ID before following logs.
-Management commands operate on all recorded instances; `wait` requires every
-instance to complete. Each machine gets its own source snapshot and filesystem.
-Downloads merge into the same local run directory, so same-name output files
-can overwrite each other. Use instance-specific output names when needed.
+Supplying a plugin CLI option also selects its backend; `-gcp` is optional with
+`-gcp_i`. Core passes the parsed value into that plugin's configuration namespace
+and saves the override in the run configuration/history. It does not interpret
+instance counts, expand ranges, or orchestrate multiple submissions.
+Dataproc owns those semantics and uses `plugins.dataproc.i`, defaulting to one
+instance (ID 0); `-gcp_i` overrides it. The former top-level `backend_instances`
+setting is rejected for new runs: move it to `plugins.dataproc.i`.
+See [the Dataproc documentation](../encap-dataproc/README.md) for its multi-machine
+submission, output merging and recovery behavior.
 
 Only explicitly selected plugin runs (a selector or configured `backend`) use
 the plugin interface. Built-in local/SSH/Slurm/Pueue execution remains in place.
@@ -52,7 +51,8 @@ copies the selected source, performs configured git tracking and generates
 `RunRequest.run_folder`; they package/execute it rather than reading the original
 source directory. Folder/file layouts and configuration generation are shared
 with Encap's normal preparation. Internal `.encap-run` records are not uploaded.
-The public plugin API is version 2; existing API 1 run records remain manageable.
+The public plugin API is version 3; existing API 1 and 2 run records remain
+manageable without modifying their saved handles.
 
 Use the existing `.encap.conf` hierarchy and `~/.encap/config.yml`:
 
@@ -148,7 +148,7 @@ example = "encap_example:registration"
 In `encap_example/__init__.py`:
 
 ```python
-from encap_lib.backends import Registration
+from encap_lib.backends import CLIOption, Registration
 
 def factory(config):
     from .backend import ExampleBackend
@@ -156,14 +156,21 @@ def factory(config):
 
 registration = Registration(
     name="example", selectors=("-example",), factory=factory,
-    api_version=2, plugin_version="0.1.0",
-    instance_selectors=("-example_i",),  # omit if the backend does not support instances
+    api_version=3, plugin_version="0.1.0",
+    cli_options=(CLIOption(
+        flags=("-example_queue",), key="queue", help="Select the provider queue",
+    ),),
 )
 ```
 
 Keep registration lightweight: no SDK imports, authentication or remote calls.
 Install the package in the **same environment** as Encap; its selector then
 appears automatically in `encap --help`.
+`CLIOption.key` names a setting in `plugins.example`. Its optional `parse`
+callable defaults to `str`; the plugin can supply a converter that validates
+provider-specific syntax and raises `argparse.ArgumentTypeError` on invalid input.
+CLI values override inherited configuration and are preserved in run history.
+Only one backend's options may be supplied, and only for a new `run`.
 
 ## Implement the contract
 
@@ -187,11 +194,9 @@ include the generated experiment configuration/history.
 The request also supplies the relative entrypoint, arguments, environment,
 run ID, record directory and optional interpreter. `record_dir` is internal
 metadata inside `run_folder`; it is not computation input.
-`RunRequest.instances` carries the selected count or explicit list of IDs
-(default `1`) to `submit`. Use `encap_lib.backends.instance_ids` to normalize
-it to a list. Register `instance_selectors` only if the backend implements
-multi-instance submission and management. This is an additive API 2 field;
-plugins without instance selectors continue to receive the default single run.
+Instance selection, parsing, validation and multi-instance orchestration belong
+to the plugin, using its own configuration namespace. There is no instance field
+in `RunRequest` and no instance-specific registration API.
 Set `Registration.supports_dependencies=True` only if the backend implements
 workspace packaging/execution. With dependencies, `RunRequest.workspace_folder`
 contains the prepared workspace, and `RunRequest.experiment_path` is its
@@ -201,7 +206,7 @@ subdirectory. Without dependencies these fields are `None` and `"."`, preserving
 the existing `run_folder` contract. These are additive API 2 fields.
 Keep a durable handle for every potentially accepted submission and never
 automatically submit missing instances after partial submission failure.
-The instance selector selects the backend as well as setting the count/list.
+Supplying any registered plugin CLI option also selects its backend.
 The factory receives only `plugins.example` from Encap's existing configuration.
 Use `config.resolve_path("key")` for local configuration-relative paths.
 
@@ -218,10 +223,13 @@ States are `submitted`, `running`, `succeeded`, `failed`, `cancelled` and `unkno
 Report success only after output saving succeeds. Core supplies five-second
 polling for `wait`; do not implement a separate wait loop. Raise
 `ConfigurationError`, `MonitoringError` or `BackendError` explicitly.
-API version 2, record version 1 and provider handle versions are independent.
+API version 3, record version 1 and provider handle versions are independent.
 API 2 replaces `source_dir` with `run_folder` and removes `source_files`/`exclude`:
 source selection and staging belong to core. Old API 1 plugin registrations
-must be updated; saved API 1 runs remain manageable with unchanged handles.
+must be updated. API 3 removes `RunRequest.instances` and `instance_selectors`,
+replacing instance-specific core logic with generic `CLIOption` forwarding.
+Plugins using API 2 must update their registrations. Saved API 1 and 2 runs
+remain manageable with unchanged handles.
 
 Test discovery, submission recovery, lifecycle operations and failures with
 fakes/mocks, without cloud credentials. For a complete implementation, see the

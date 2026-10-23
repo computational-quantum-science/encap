@@ -15,7 +15,7 @@ from encap_lib import encap_settings as settings
 from encap_lib.run_preparation import resolve_dependencies, stage_source, stage_workspace, write_run_configuration
 from encap_lib.backends import (
     BackendError, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
-    RunHandle, RunRequest, RunStatus, exit_code, instance_ids, wait,
+    RunHandle, RunRequest, RunStatus, exit_code, wait,
 )
 
 MANAGEMENT = frozenset(("wait", "tail", "pull", "status", "kill"))
@@ -64,17 +64,21 @@ def _tail_pull(backend, handle, destination):
 
 def dispatch(pargs, registrations, get_script_name):
     """Return True when handled. Saved plugin runs never consult current provider settings."""
-    selected_instances = [
-        (name, getattr(pargs, f"backend_instances_{name}", None))
-        for name in registrations
-        if getattr(pargs, f"backend_instances_{name}", None) is not None
-    ]
-    if selected_instances:
-        if len(selected_instances) != 1 or pargs.mode != "run":
-            raise ConfigurationError("Instance selectors require run and exactly one backend")
-        selected_name, instances = selected_instances[0]
+    selected_options = []
+    for name, registration in registrations.items():
+        values = {
+            option.key: getattr(pargs, f"plugin_{name}_{option.key}")
+            for option in registration.cli_options
+            if getattr(pargs, f"plugin_{name}_{option.key}", None) is not None
+        }
+        if values:
+            selected_options.append((name, values))
+    if selected_options:
+        if len(selected_options) != 1 or pargs.mode != "run":
+            raise ConfigurationError("Plugin options require run and exactly one backend")
+        selected_name, _ = selected_options[0]
         if pargs.backend is not None and pargs.backend != selected_name:
-            raise ConfigurationError("Conflicting backend and instance selectors")
+            raise ConfigurationError("Conflicting backend and plugin options")
         pargs.backend = selected_name
     destination = run_destination(pargs.target, pargs.name) if pargs.target and pargs.name else None
     writer = RecordWriter(destination / ".encap-run") if destination else None
@@ -142,6 +146,11 @@ def dispatch(pargs, registrations, get_script_name):
 
     effective = copy.deepcopy(pargs.base_config)
     overrides = copy.deepcopy(settings.args_config)
+    if selected_options:
+        selected_name, values = selected_options[0]
+        settings.merge_dicts(overrides, {
+            "plugins": {selected_name: PluginConfig(values, os.getcwd())},
+        })
     if pargs.i is None:
         overrides.pop("i", None)
     project = effective.get("projects", {}).get(os.getcwd(), {})
@@ -167,10 +176,10 @@ def dispatch(pargs, registrations, get_script_name):
         return False
     registration = _registration(name, registrations)
     _check_options(pargs, effective)
-    instances = selected_instances[0][1] if selected_instances else effective.get("backend_instances", 1)
-    instance_ids(instances)
-    if instances != 1 and not registration.instance_selectors:
-        raise ConfigurationError(f"Backend {name} does not support multiple instances")
+    if "backend_instances" in effective:
+        raise ConfigurationError(
+            "backend_instances is no longer supported; configure instances in the selected plugin's namespace"
+        )
     backup_on_overwrite = effective.get("backup_on_overwrite", False)
     if type(backup_on_overwrite) is not bool:
         raise ConfigurationError("backup_on_overwrite must be true or false")
@@ -245,13 +254,12 @@ def dispatch(pargs, registrations, get_script_name):
             raise ConfigurationError("Entrypoint is excluded from run preparation")
         effective["backend"] = name
         effective["script_name"] = entrypoint
-        effective["backend_instances"] = instances
         run_overrides = copy.deepcopy(overrides)
-        run_overrides.update(backend=name, script_name=entrypoint, backend_instances=instances)
+        run_overrides.update(backend=name, script_name=entrypoint)
         write_run_configuration(destination, effective, run_overrides)
         workspace, experiment_path = stage_workspace(source_dir, destination, dependencies, excluded)
         request = RunRequest(destination, entrypoint, arguments, dict(environment), pargs.name, writer.directory,
-                             effective.get("interpreter"), instances=instances,
+                             effective.get("interpreter"),
                              workspace_folder=workspace, experiment_path=experiment_path)
         handle = backend.submit(request, writer)
         writer.save_handle(handle, confirmed=True)

@@ -12,7 +12,7 @@ import yaml
 
 from encap_lib import backends, encap_settings as settings, native_wait, plugin_cli
 from encap_lib.backends import (
-    BackendError, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
+    BackendError, CLIOption, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
     Registration, RunHandle, RunStatus,
 )
 
@@ -36,6 +36,12 @@ def test_discovery_and_selector_collisions(monkeypatch):
         ([registration, registration], "Duplicate backend"),
         ([Registration("other", Mock(), ("-fake",)), registration], "duplicate plugin selector"),
         ([Registration("fake", Mock(), api_version=999)], "Install compatible"),
+        ([Registration("fake", Mock(), ("-fake",), cli_options=(
+            CLIOption(("-fake",), "setting"),
+        ))], "duplicate plugin selector"),
+        ([Registration("fake", Mock(), cli_options=(
+            CLIOption(("-first",), "setting"), CLIOption(("-second",), "setting"),
+        ))], "duplicate plugin option"),
     ):
         entries.select.return_value = [SimpleNamespace(name=item.name, load=lambda item=item: item) for item in registrations]
         with pytest.raises(ConfigurationError, match=message):
@@ -131,7 +137,10 @@ def cli(tmp_path, monkeypatch):
     factory = Mock()
     backend = factory.return_value
     backend.submit.return_value = RunHandle({"operation": "123"})
-    registration = Registration("fake", factory, ("-fake",), instance_selectors=("-fake_i",))
+    registration = Registration("fake", factory, ("-fake",), cli_options=(
+        CLIOption(("-fake_setting",), "setting"),
+        CLIOption(("-fake_number",), "number", parse=int),
+    ))
     monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
     monkeypatch.setattr(cli, "get_machine", Mock(side_effect=AssertionError("must not construct machine")))
     monkeypatch.setattr(cli, "LocalMachine", Mock(side_effect=AssertionError("must not construct machine")))
@@ -190,41 +199,74 @@ def test_plugin_conflicting_native_options(cli, monkeypatch, flag):
     factory.assert_not_called()
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("4", 4), ("[0, 2, 3]", [0, 2, 3]), ("range(2, 5)", [2, 3, 4]),
-    ("range(4)", [0, 1, 2, 3]), ("range(1, 6, 2)", [1, 3, 5]), ("[7]", [7]),
-])
-def test_plugin_instance_selector_reaches_submit(cli, monkeypatch, text, expected):
+@pytest.mark.parametrize("text", ["value", "[0, 2, 3]", "range(2, 5)", "0"])
+def test_plugin_options_reach_namespace_without_interpretation(cli, monkeypatch, text):
     module, factory, backend = cli
-    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", text)
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_setting", text)
     request = backend.submit.call_args.args[0]
-    assert request.instances == expected
-    assert yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())["backend_instances"] == expected
+    assert factory.call_args.args[0]["setting"] == text
+    assert factory.call_args.args[0].resolve_path("setting") == Path.cwd() / text
+    assert not hasattr(request, "instances")
+    for name in (".encap.conf", ".encap_history.conf"):
+        saved = yaml.safe_load((request.run_folder / name).read_text())
+        assert saved["plugins"]["fake"]["setting"] == text
+        assert "backend_instances" not in saved
 
 
-@pytest.mark.parametrize("text", ["0", "-2", "[]", "[1, 1]", "[True]", "[1.2]", "range(0)", "range(1, 3, 0)"])
-def test_invalid_plugin_instances_never_submit(cli, monkeypatch, text):
+@pytest.mark.parametrize("text", ["not-a-number", "[]"])
+def test_plugin_defined_parser_rejects_invalid_options(cli, monkeypatch, text):
     module, factory, backend = cli
     with pytest.raises(SystemExit) as result:
-        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", text)
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_number", text)
     assert result.value.code == 2
     factory.assert_not_called()
     backend.submit.assert_not_called()
 
 
-def test_plugin_instance_selector_rejects_native_i(cli, monkeypatch):
+def test_plugin_option_rejects_native_i(cli, monkeypatch):
     module, factory, backend = cli
     with pytest.raises(SystemExit) as result:
-        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_i", "4", "-i", "2")
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_setting", "value", "-i", "2")
     assert result.value.code == 2
     backend.submit.assert_not_called()
 
 
-def test_plugin_configured_instances_reach_submit(cli, monkeypatch, tmp_path):
+def test_plugin_namespace_options_reach_factory(cli, monkeypatch, tmp_path):
     module, factory, backend = cli
-    (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\nbackend_instances: [2, 5]\n")
+    (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\nplugins:\n  fake:\n    setting: [2, 5]\n")
     invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
-    assert backend.submit.call_args.args[0].instances == [2, 5]
+    assert factory.call_args.args[0]["setting"] == [2, 5]
+
+
+def test_plugin_options_merge_and_override_inherited_namespace(cli, monkeypatch, tmp_path):
+    module, factory, backend = cli
+    (tmp_path / ".encap.conf").write_text("plugins:\n  fake:\n    setting: inherited\n    number: 2\n")
+    (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    number: 3\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake_number", "4")
+    assert factory.call_args.args[0] == {"setting": "inherited", "number": 4}
+    request = backend.submit.call_args.args[0]
+    history = yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())
+    assert history["plugins"]["fake"] == {"setting": "inherited", "number": 4}
+
+
+def test_plugin_options_require_new_run(cli, monkeypatch):
+    module, factory, backend = cli
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "status", "experiment", "-n", "trial", "-fake_setting", "value")
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+
+
+def test_removed_core_option_requires_explicit_migration(cli, monkeypatch, tmp_path):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\nbackend_instances: 2\n")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+    assert not (tmp_path / "0encap_folder").exists()
 
 
 def test_uncertain_submission_preserves_intent(cli, tmp_path, monkeypatch):
@@ -590,7 +632,7 @@ def test_submit_receives_prepared_run_folder_and_configuration(cli, tmp_path, mo
         assert config["script_name"] == history["script_name"] == request.entrypoint == "run.py"
         assert config["args"] == history["args"] == "--value command-line"
         assert history["plugins"]["fake"]["bucket"] == "original"
-        assert writer.read()["api_version"] == 2
+        assert writer.read()["api_version"] == backends.API_VERSION
         return RunHandle({"operation": "prepared"})
     backend.submit.side_effect = submit
     invoke(module, monkeypatch, "run", target, "-n", "trial", "-fake", "-a", "--value command-line")
@@ -671,12 +713,13 @@ def test_dependencies_reject_unsupported_backends(cli, tmp_path, monkeypatch, ba
     assert not (tmp_path / "0encap_folder").exists()
 
 
-def test_api_one_saved_runs_remain_manageable(cli, tmp_path, monkeypatch):
+@pytest.mark.parametrize("api_version", [1, 2])
+def test_previous_api_saved_runs_remain_manageable(cli, tmp_path, monkeypatch, api_version):
     module, factory, backend = cli
     invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
     writer = RecordWriter(tmp_path / "0encap_folder" / "experiment" / "trial" / ".encap-run")
-    writer.update(api_version=1)
+    writer.update(api_version=api_version)
     backend.status.return_value = RunStatus("succeeded")
     invoke(module, monkeypatch, "status", "experiment", "-n", "trial")
-    assert writer.read()["api_version"] == 1
+    assert writer.read()["api_version"] == api_version
     backend.status.assert_called_once_with(RunHandle({"operation": "123"}))

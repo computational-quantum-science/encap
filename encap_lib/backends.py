@@ -1,6 +1,5 @@
-"""Public, provider-independent execution backend API (version 2)."""
+"""Public, provider-independent execution backend API (version 3)."""
 
-import ast
 import json
 import math
 import os
@@ -10,11 +9,11 @@ import time
 from dataclasses import asdict, dataclass, field
 from importlib import metadata
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 from filelock import FileLock
 
-API_VERSION = 2
+API_VERSION = 3
 RECORD_VERSION = 1
 POLL_INTERVAL = 5.0
 STATES = frozenset(("submitted", "running", "succeeded", "failed", "cancelled", "unknown"))
@@ -64,7 +63,6 @@ class RunRequest:
     run_id: str
     record_dir: Path
     interpreter: Optional[str] = None
-    instances: Union[int, List[int]] = 1
     workspace_folder: Optional[Path] = None
     experiment_path: str = "."
 
@@ -97,13 +95,22 @@ class Backend(Protocol):
 
 
 @dataclass(frozen=True)
+class CLIOption:
+    flags: Tuple[str, ...]
+    key: str
+    parse: Callable[[str], object] = str
+    help: str = ""
+    metavar: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class Registration:
     name: str
     factory: Callable[[PluginConfig], Backend]
     selectors: Tuple[str, ...] = ()
     api_version: int = API_VERSION
     plugin_version: str = "unknown"
-    instance_selectors: Tuple[str, ...] = ()
+    cli_options: Tuple[CLIOption, ...] = ()
     supports_dependencies: bool = False
 
 
@@ -128,7 +135,15 @@ def discover() -> Dict[str, Registration]:
             raise ConfigurationError(f"Invalid backend name: {registration.name!r}")
         if registration.name in registrations:
             raise ConfigurationError(f"Duplicate backend name: {registration.name}")
-        for flag in registration.selectors + registration.instance_selectors:
+        keys = set()
+        for option in registration.cli_options:
+            if (not isinstance(option, CLIOption) or not option.flags
+                    or not re.fullmatch(r"[a-z][a-z0-9_]*", option.key)
+                    or option.key in keys or not callable(option.parse)):
+                raise ConfigurationError(f"Invalid or duplicate plugin option for {registration.name}")
+            keys.add(option.key)
+        option_flags = tuple(flag for option in registration.cli_options for flag in option.flags)
+        for flag in registration.selectors + option_flags:
             if not re.fullmatch(r"--?[A-Za-z][A-Za-z0-9_-]*", flag) or flag in flags:
                 raise ConfigurationError(f"Invalid or duplicate plugin selector: {flag}")
             flags.add(flag)
@@ -146,40 +161,14 @@ def register_selectors(parser, registrations):
         if registration.selectors:
             group.add_argument(*registration.selectors, dest="backend", action="store_const",
                                const=registration.name, help=f"Use the {registration.name} backend")
-        for flag in registration.instance_selectors:
-            if flag in parser._option_string_actions:
-                raise ConfigurationError(f"Plugin selector {flag} conflicts with an Encap option")
-        if registration.instance_selectors:
+        for option in registration.cli_options:
+            for flag in option.flags:
+                if flag in parser._option_string_actions:
+                    raise ConfigurationError(f"Plugin selector {flag} conflicts with an Encap option")
             parser.add_argument(
-                *registration.instance_selectors, dest=f"backend_instances_{registration.name}",
-                type=parse_instances, default=None, metavar="INSTANCES",
-                help=f"Launch {registration.name} instances: a count, list of IDs, or range(...)",
+                *option.flags, dest=f"plugin_{registration.name}_{option.key}",
+                type=option.parse, default=None, metavar=option.metavar, help=option.help,
             )
-
-
-def instance_ids(value):
-    if type(value) is int:
-        if value <= 0:
-            raise ConfigurationError("Instance count must be positive")
-        return list(range(value))
-    if (not isinstance(value, list) or not value
-            or any(type(item) is not int or item < 0 for item in value)
-            or len(set(value)) != len(value)):
-        raise ConfigurationError("Instances must be a positive count or a nonempty list of unique nonnegative integers")
-    return list(value)
-
-
-def parse_instances(text):
-    import argparse
-    try:
-        if re.fullmatch(r"range\(\s*-?\d+(?:\s*,\s*-?\d+){0,2}\s*\)", text):
-            value = list(range(*ast.literal_eval("(" + text[6:-1] + ",)")))
-        else:
-            value = ast.literal_eval(text)
-        instance_ids(value)
-        return value
-    except (ValueError, SyntaxError, TypeError, ConfigurationError) as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def exit_code(status: RunStatus) -> int:
@@ -268,7 +257,7 @@ class RecordWriter:
         if not isinstance(record, dict):
             raise BackendError(f"Invalid run record: {self.path}")
         if (type(record.get("record_version")) is not int or record["record_version"] != RECORD_VERSION
-                or type(record.get("api_version")) is not int or record["api_version"] not in (1, API_VERSION)):
+                or type(record.get("api_version")) is not int or record["api_version"] not in (1, 2, API_VERSION)):
             raise BackendError("Incompatible run record/API version; install the Encap version that wrote this record")
         if not all(isinstance(record.get(key), str) for key in ("backend", "plugin_version", "run_id", "state")):
             raise BackendError(f"Invalid run record fields: {self.path}")
