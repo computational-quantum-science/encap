@@ -6,6 +6,15 @@ import copy
 from pathlib import Path
 from encap_lib.backends import ConfigurationError, PluginConfig
 
+
+class DependencyPaths(list):
+    """Dependency paths relative to their declaring configuration file."""
+
+    def __init__(self, values, origin):
+        super().__init__(values)
+        self.origin = origin
+
+
 def read_terminal_arguments(pargs):
     global args_config, config, using_slurm, using_pueue
 
@@ -66,6 +75,10 @@ def read_config_file(file_name):
                     name: PluginConfig(namespace, str(Path(file_name).resolve().parent))
                     for name, namespace in value.items()
                 }
+            elif key == "dependencies":
+                if not isinstance(value, list) or any(not isinstance(path, str) or not path.strip() for path in value):
+                    raise ConfigurationError(f"{file_name}: dependencies must be a list of nonempty path strings")
+                mapping[key] = DependencyPaths(value, str(Path(file_name).resolve().parent))
             elif isinstance(value, dict):
                 plugin_namespaces(value)
     plugin_namespaces(config_)
@@ -114,6 +127,7 @@ def merge_dicts(dict1, dict2):
     return dict1
 
 yaml.add_representer(PluginConfig, lambda dumper, value: dumper.represent_dict(value))
+yaml.add_representer(DependencyPaths, lambda dumper, value: dumper.represent_list(value))
 
 def get_item(item, config_location):
     global config

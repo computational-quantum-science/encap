@@ -7,6 +7,8 @@
 Encap is a user-friendly tool designed to help you manage and keep track of your computational experiments, especially in the field of scientific computing. With Encap, you can easily run various experiments in separate containers and maintain a record of the results.
 
 Want to add an execution backend? See the brief [plugin author guide](PLUGIN_README.md).
+For Dataproc source snapshots that preserve sibling-folder paths, see
+[source dependencies](PLUGIN_README.md#source-dependencies).
 
 ## Features
 

@@ -65,6 +65,8 @@ class RunRequest:
     record_dir: Path
     interpreter: Optional[str] = None
     instances: Union[int, List[int]] = 1
+    workspace_folder: Optional[Path] = None
+    experiment_path: str = "."
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,7 @@ class Registration:
     api_version: int = API_VERSION
     plugin_version: str = "unknown"
     instance_selectors: Tuple[str, ...] = ()
+    supports_dependencies: bool = False
 
 
 def discover() -> Dict[str, Registration]:

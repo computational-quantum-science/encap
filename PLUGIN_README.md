@@ -71,6 +71,31 @@ or archiving results; loss of that record prevents reliable reconnection.
 Folder outputs retain `0encap_folder/<source>/<name>`; file outputs retain
 `<source-without-extension>/<name>`.
 
+### Source dependencies
+
+Supporting backends (currently Dataproc) accept a top-level list:
+
+```yaml
+dependencies:
+  - ../../src
+  - ../shared_experiment
+```
+
+Entries select files or directories, relative to the configuration file declaring
+the list, including inherited/global configuration. A child list replaces the
+parent list; `dependencies: []` clears it. Only the selected source and dependencies
+are copied. Their common ancestor determines their layout, not what gets copied.
+Dependencies are snapshots, not executed experiments; their own dependency lists
+are not followed. Missing/excluded paths and symlinks are errors.
+Secrets, caches, virtual environments and internal run records are excluded.
+Python import paths are not changed automatically.
+
+Core saves the workspace under the run's `.encap-run/workspace`, keeping normal
+source/output locations unchanged. Relative paths work inside this workspace;
+the flattened local output directory is not an executable workspace.
+Built-in execution and plugins without dependency support reject nonempty lists
+rather than silently ignoring them.
+
 `wait` polls every five seconds, streams no logs and pulls nothing. Ctrl-C in a
 plugin `wait`/`tail` detaches with code 130, never cancelling remote work.
 Only explicit `kill` requests cancellation. Successful plugin waiting also
@@ -98,9 +123,11 @@ recovery instructions rather than reusing the run name.
 For an existing plugin run, `run` checks its remote status and prompts to
 overwrite only after computation is confirmed succeeded, failed or cancelled.
 `-y` accepts the prompt automatically, but never bypasses the status check.
-The previous directory (outputs and remote handle included) is preserved beside
-the new run as `<name>.backup-<unique-suffix>`. Management commands can use that
-backup name with `-n`. Active, unknown, unreachable and unconfirmed runs cannot
+By default, overwriting deletes the previous local run, including outputs and
+its remote handle. Set `backup_on_overwrite: true` in `.encap.conf` or
+`~/.encap/config.yml` to preserve it as `<name>.backup-<unique-suffix>` instead.
+Management commands can use that backup name with `-n`.
+Active, unknown, unreachable and unconfirmed runs cannot
 be overwritten. Overwriting submits new work; it does not cancel or delete any
 old remote resources.
 
@@ -165,6 +192,13 @@ metadata inside `run_folder`; it is not computation input.
 it to a list. Register `instance_selectors` only if the backend implements
 multi-instance submission and management. This is an additive API 2 field;
 plugins without instance selectors continue to receive the default single run.
+Set `Registration.supports_dependencies=True` only if the backend implements
+workspace packaging/execution. With dependencies, `RunRequest.workspace_folder`
+contains the prepared workspace, and `RunRequest.experiment_path` is its
+POSIX-relative experiment directory. Package the workspace, run with that
+subdirectory as the working directory, and collect outputs only from that
+subdirectory. Without dependencies these fields are `None` and `"."`, preserving
+the existing `run_folder` contract. These are additive API 2 fields.
 Keep a durable handle for every potentially accepted submission and never
 automatically submit missing instances after partial submission failure.
 The instance selector selects the backend as well as setting the count/list.

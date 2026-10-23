@@ -1,10 +1,88 @@
 """Shared configuration preparation, separate from computation execution."""
 
 import copy
+import fnmatch
+import os
+import shutil
 from pathlib import Path
 
 from encap_lib import encap_settings as settings
 from encap_lib import git_tracker
+from encap_lib.backends import ConfigurationError
+
+
+SOURCE_EXCLUDED = frozenset((
+    ".git", ".env", ".venv", "venv", ".output", "runs", "0encap_folder", ".encap-run",
+    ".gcp", "__pycache__", ".pytest_cache", ".ruff_cache", ".DS_Store",
+))
+
+
+def _excluded(path, relative, patterns):
+    return any(part in (".encap-run", "0encap_folder") for part in relative.parts) or any(
+        fnmatch.fnmatch(relative.as_posix(), pattern.rstrip("/"))
+        or fnmatch.fnmatch(path.name, pattern.rstrip("/")) for pattern in patterns
+    )
+
+
+def resolve_dependencies(values, source_dir, excluded):
+    if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ConfigurationError("dependencies must be a list of nonempty path strings")
+    paths = []
+    for value in values:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            origin = getattr(values, "origin", None)
+            if origin is None:
+                raise ConfigurationError("Relative dependencies require a declaring configuration file")
+            path = Path(origin) / path
+        path = Path(os.path.abspath(path))
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+            raise ConfigurationError(f"Dependency symlinks are unsupported: {path}")
+        if not path.is_file() and not path.is_dir():
+            raise ConfigurationError(f"Dependency does not exist or is not a regular file/directory: {path}")
+        relative = Path(os.path.relpath(path, source_dir))
+        if any(part in SOURCE_EXCLUDED for part in path.parts) or _excluded(path, relative, excluded):
+            raise ConfigurationError(f"Dependency is excluded from source packaging: {path}")
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def stage_source(source, destination, excluded):
+    def ignore(directory, names):
+        ignored = []
+        for name in names:
+            path = Path(directory) / name
+            relative = path.relative_to(source)
+            if path == destination or _excluded(path, relative, excluded):
+                ignored.append(name)
+            elif path.is_symlink():
+                raise ConfigurationError(f"Source symlinks are unsupported: {path}")
+            elif not path.is_file() and not path.is_dir():
+                raise ConfigurationError(f"Source must contain regular files and directories: {path}")
+        return ignored
+    if source.is_symlink():
+        raise ConfigurationError(f"Source symlinks are unsupported: {source}")
+    if source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True, ignore=ignore)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def stage_workspace(source_dir, run_folder, dependencies, excluded):
+    if not dependencies:
+        return None, "."
+    source_dir = Path(os.path.abspath(source_dir))
+    root = Path(os.path.commonpath([source_dir, *[path.parent if path.is_file() else path for path in dependencies]]))
+    workspace = run_folder / ".encap-run" / "workspace"
+    workspace.mkdir()
+    patterns = [*excluded, *sorted(SOURCE_EXCLUDED)]
+    for dependency in dependencies:
+        stage_source(dependency, workspace / dependency.relative_to(root), patterns)
+    experiment_path = source_dir.relative_to(root)
+    stage_source(run_folder, workspace / experiment_path, patterns)
+    return workspace, experiment_path.as_posix()
 
 
 def write_run_configuration(run_folder, config, overrides):

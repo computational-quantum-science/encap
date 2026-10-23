@@ -403,8 +403,11 @@ def test_run_tails_only_after_confirmed_record_and_preserves_submission(cli, tmp
 
 @pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled"])
 @pytest.mark.parametrize("automatic", [False, True])
-def test_overwrite_finished_run_preserves_old_record_and_outputs(cli, tmp_path, monkeypatch, state, automatic):
+@pytest.mark.parametrize("backup_enabled", [False, True])
+def test_overwrite_finished_run_respects_backup_setting(cli, tmp_path, monkeypatch, state, automatic, backup_enabled):
     module, factory, backend = cli
+    if backup_enabled:
+        (tmp_path / "experiment" / ".encap.conf").write_text("backup_on_overwrite: true\n")
     invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
     destination = tmp_path / "0encap_folder" / "experiment" / "trial"
     (destination / "result.txt").write_text("old output")
@@ -414,14 +417,55 @@ def test_overwrite_finished_run_preserves_old_record_and_outputs(cli, tmp_path, 
     monkeypatch.setattr("builtins.input", prompt)
     invoke(module, monkeypatch, "run", "experiment", "-n", "trial", *(["-y"] if automatic else []))
     assert prompt.call_count == (0 if automatic else 1)
+    if not automatic:
+        assert ("preserve the old run in a backup" in prompt.call_args.args[0]) == backup_enabled
     backups = list(destination.parent.glob("trial.backup-*"))
-    assert len(backups) == 1
-    assert (backups[0] / "result.txt").read_text() == "old output"
-    assert RecordWriter(backups[0] / ".encap-run").read()["handle"]["data"] == {"operation": "123"}
+    assert len(backups) == int(backup_enabled)
+    if backup_enabled:
+        assert (backups[0] / "result.txt").read_text() == "old output"
+        assert RecordWriter(backups[0] / ".encap-run").read()["handle"]["data"] == {"operation": "123"}
+    assert not (destination / "result.txt").exists()
     assert RecordWriter(destination / ".encap-run").read()["handle"]["data"] == {"operation": "new"}
     assert backend.submit.call_count == 2
     backend.cancel.assert_not_called()
     assert backend.pull.call_count == 2
+
+
+@pytest.mark.parametrize("value", ["'false'", "1", "null", "[]"])
+def test_invalid_backup_setting_does_not_overwrite(cli, tmp_path, monkeypatch, value):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    (destination / "result.txt").write_text("old output")
+    backend.status.return_value = RunStatus("failed")
+    (tmp_path / "experiment" / ".encap.conf").write_text(f"backup_on_overwrite: {value}\n")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-y")
+    assert result.value.code == 2
+    assert (destination / "result.txt").read_text() == "old output"
+    backend.submit.assert_called_once()
+
+
+@pytest.mark.parametrize("scope", ["global", "project"])
+@pytest.mark.parametrize("local_override", [False, True])
+def test_backup_setting_inherits_and_respects_local_override(cli, tmp_path, monkeypatch, scope, local_override):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    (destination / "result.txt").write_text("old output")
+    if scope == "global":
+        settings.config["backup_on_overwrite"] = True
+    else:
+        settings.config["projects"] = {str(tmp_path): {"backup_on_overwrite": True}}
+    if local_override:
+        (tmp_path / "experiment" / ".encap.conf").write_text("backup_on_overwrite: false\n")
+    backend.status.return_value = RunStatus("failed")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-y")
+    backups = list(destination.parent.glob("trial.backup-*"))
+    assert len(backups) == int(not local_override)
+    if backups:
+        assert (backups[0] / "result.txt").read_text() == "old output"
+    assert not (destination / "result.txt").exists()
 
 
 def test_declining_overwrite_preserves_existing_run(cli, tmp_path, monkeypatch):
@@ -595,6 +639,36 @@ def test_preparation_failure_never_submits(cli, tmp_path, monkeypatch):
     assert result.value.code == 2
     backend.submit.assert_not_called()
     backend.tail.assert_not_called()
+
+
+@pytest.mark.parametrize("file_mode", [False, True])
+def test_dependency_workspace_reaches_supporting_plugin(cli, tmp_path, monkeypatch, file_mode):
+    module, factory, backend = cli
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "data.txt").write_text("snapshot")
+    (tmp_path / "experiment" / ".encap.conf").write_text("dependencies: [../src]\n")
+    registration = Registration("fake", factory, ("-fake",), supports_dependencies=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    target = "experiment/run.py" if file_mode else "experiment"
+    invoke(module, monkeypatch, "run", target, "-n", "trial", "-fake")
+    request = backend.submit.call_args.args[0]
+    assert request.experiment_path == "experiment"
+    assert request.workspace_folder == request.record_dir / "workspace"
+    assert (request.workspace_folder / "src/data.txt").read_text() == "snapshot"
+    assert (request.workspace_folder / "experiment/.encap_history.conf").is_file()
+    backend.pull.assert_called_once_with(backend.submit.return_value, request.run_folder)
+
+
+@pytest.mark.parametrize("backend_flag", [[], ["-fake"]])
+def test_dependencies_reject_unsupported_backends(cli, tmp_path, monkeypatch, backend_flag):
+    module, factory, backend = cli
+    (tmp_path / "src").mkdir()
+    (tmp_path / "experiment" / ".encap.conf").write_text("dependencies: [../src]\n")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", *backend_flag)
+    assert result.value.code == 2
+    backend.submit.assert_not_called()
+    assert not (tmp_path / "0encap_folder").exists()
 
 
 def test_api_one_saved_runs_remain_manageable(cli, tmp_path, monkeypatch):

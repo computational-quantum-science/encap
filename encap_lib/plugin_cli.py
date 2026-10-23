@@ -1,7 +1,6 @@
 """Plugin command dispatch, isolated from Encap's existing machine execution paths."""
 
 import copy
-import fnmatch
 import json
 import os
 import re
@@ -13,7 +12,7 @@ from pathlib import Path
 from filelock import FileLock
 
 from encap_lib import encap_settings as settings
-from encap_lib.run_preparation import write_run_configuration
+from encap_lib.run_preparation import resolve_dependencies, stage_source, stage_workspace, write_run_configuration
 from encap_lib.backends import (
     BackendError, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
     RunHandle, RunRequest, RunStatus, exit_code, instance_ids, wait,
@@ -61,25 +60,6 @@ def _tail_pull(backend, handle, destination):
     backend.tail(handle)
     print(f"Pulling outputs to {destination}", flush=True)
     backend.pull(handle, destination)
-
-
-def _stage_source(source, destination, excluded):
-    def ignore(directory, names):
-        ignored = []
-        for name in names:
-            path = Path(directory) / name
-            relative = path.relative_to(source)
-            if (name in (".encap-run", "0encap_folder") or path == destination
-                    or any(fnmatch.fnmatch(relative.as_posix(), pattern.rstrip("/"))
-                           or fnmatch.fnmatch(name, pattern.rstrip("/")) for pattern in excluded)):
-                ignored.append(name)
-            elif path.is_symlink():
-                raise ConfigurationError(f"Source symlinks are unsupported: {path}")
-        return ignored
-    if source.is_dir():
-        shutil.copytree(source, destination, dirs_exist_ok=True, ignore=ignore)
-    else:
-        shutil.copy2(source, destination / source.name)
 
 
 def dispatch(pargs, registrations, get_script_name):
@@ -167,7 +147,7 @@ def dispatch(pargs, registrations, get_script_name):
     project = effective.get("projects", {}).get(os.getcwd(), {})
     if not isinstance(project, dict):
         raise ConfigurationError("Project configuration must be a mapping")
-    for key in ("backend", "plugins"):
+    for key in ("backend", "plugins", "backup_on_overwrite", "dependencies"):
         if key in project:
             value = {key: project[key]}
             settings.merge_dicts(effective, value)
@@ -181,6 +161,8 @@ def dispatch(pargs, registrations, get_script_name):
         settings.merge_dicts(effective, overrides)
     name = pargs.backend if pargs.backend is not None else effective.get("backend", replacement["backend"] if replacement else None)
     if name is None:
+        if effective.get("dependencies"):
+            raise ConfigurationError("dependencies require a supporting execution backend, such as Dataproc")
         settings.merge_dicts(settings.config, copy.deepcopy(settings.args_config))
         return False
     registration = _registration(name, registrations)
@@ -189,6 +171,9 @@ def dispatch(pargs, registrations, get_script_name):
     instance_ids(instances)
     if instances != 1 and not registration.instance_selectors:
         raise ConfigurationError(f"Backend {name} does not support multiple instances")
+    backup_on_overwrite = effective.get("backup_on_overwrite", False)
+    if type(backup_on_overwrite) is not bool:
+        raise ConfigurationError("backup_on_overwrite must be true or false")
     if pargs.mode != "run":
         raise ConfigurationError(f"{pargs.mode} requires a saved plugin run; only run creates one")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", pargs.name):
@@ -223,14 +208,21 @@ def dispatch(pargs, registrations, get_script_name):
         if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
             raise ConfigurationError(f"{key} must be a list of patterns")
         excluded.extend(values)
+    dependencies = resolve_dependencies(effective.get("dependencies", []), source_dir, excluded)
+    if dependencies and not registration.supports_dependencies:
+        raise ConfigurationError(f"Backend {name} does not support dependencies")
     namespace = effective.get("plugins", {}).get(name, PluginConfig())
     if not isinstance(namespace, PluginConfig):
         namespace = PluginConfig(namespace)
     backend = registration.factory(namespace)
     if replacement is not None and not pargs.yes:
+        action = (
+            "Overwrite it and preserve the old run in a backup?"
+            if backup_on_overwrite else "Overwrite it? The previous local run will be deleted."
+        )
         answer = input(
             f"The experiment {destination} already exists ({status.state}). "
-            "Overwrite it and preserve the old run in a backup? y/n: "
+            f"{action} y/n: "
         )
         if answer.strip().lower() != "y":
             print("Run unchanged; no new computation submitted.")
@@ -240,12 +232,15 @@ def dispatch(pargs, registrations, get_script_name):
         if replacement is not None:
             if writer.read() != replacement:
                 raise BackendError("Run record changed while preparing overwrite. Retry after checking its status.")
-            backup = destination.with_name(f"{destination.name}.backup-{uuid.uuid4().hex[:12]}")
-            destination.rename(backup)
-            print(f"Previous run preserved at: {backup}")
+            if backup_on_overwrite:
+                backup = destination.with_name(f"{destination.name}.backup-{uuid.uuid4().hex[:12]}")
+                destination.rename(backup)
+                print(f"Previous run preserved at: {backup}")
+            else:
+                shutil.rmtree(destination)
         writer = RecordWriter.reserve(destination, registration, pargs.name)
     try:
-        _stage_source(source, destination, excluded)
+        stage_source(source, destination if source.is_dir() else destination / source.name, excluded)
         if not (destination / entrypoint).is_file():
             raise ConfigurationError("Entrypoint is excluded from run preparation")
         effective["backend"] = name
@@ -254,8 +249,10 @@ def dispatch(pargs, registrations, get_script_name):
         run_overrides = copy.deepcopy(overrides)
         run_overrides.update(backend=name, script_name=entrypoint, backend_instances=instances)
         write_run_configuration(destination, effective, run_overrides)
+        workspace, experiment_path = stage_workspace(source_dir, destination, dependencies, excluded)
         request = RunRequest(destination, entrypoint, arguments, dict(environment), pargs.name, writer.directory,
-                             effective.get("interpreter"), instances=instances)
+                             effective.get("interpreter"), instances=instances,
+                             workspace_folder=workspace, experiment_path=experiment_path)
         handle = backend.submit(request, writer)
         writer.save_handle(handle, confirmed=True)
     except (BackendError, OSError, KeyboardInterrupt) as error:
