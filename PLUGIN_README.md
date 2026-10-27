@@ -91,8 +91,12 @@ Secrets, caches, virtual environments and internal run records are excluded.
 Python import paths are not changed automatically.
 
 Core saves the workspace under the run's `.encap-run/workspace`, keeping normal
-source/output locations unchanged. Relative paths work inside this workspace;
-the flattened local output directory is not an executable workspace.
+source/output locations unchanged. It preserves source-relative dependency
+locations; the backend defines where the prepared experiment executes.
+Dataproc relocates it to its saved-run path in the worker workspace, retaining
+dependencies at their original locations. Its scripts should use the worker root
+for dependency paths rather than assuming the source directory is the cwd.
+The flattened local output directory alone is not a dependency workspace.
 Built-in execution and plugins without dependency support reject nonempty lists
 rather than silently ignoring them.
 
@@ -200,10 +204,22 @@ in `RunRequest` and no instance-specific registration API.
 Set `Registration.supports_dependencies=True` only if the backend implements
 workspace packaging/execution. With dependencies, `RunRequest.workspace_folder`
 contains the prepared workspace, and `RunRequest.experiment_path` is its
-POSIX-relative experiment directory. Package the workspace, run with that
-subdirectory as the working directory, and collect outputs only from that
-subdirectory. Without dependencies these fields are `None` and `"."`, preserving
+POSIX-relative experiment directory. Package the workspace; a backend may relocate
+the prepared experiment to its saved-run path while preserving dependency
+locations. Run from the chosen experiment directory and collect outputs only
+from that directory. Without dependencies these fields are `None` and `"."`, preserving
 the existing `run_folder` contract. These are additive API 2 fields.
+`RunRequest.workspace_origin` is optional, provider-independent path metadata:
+the original local directory represented by the prepared workspace root, or the
+original source directory when no dependency workspace was needed. It lets a
+plugin preserve paths relative to a configured root without inferring source
+locations from saved-run names. It is not another source tree to read or upload;
+the prepared folder/workspace remains the only input. Plugins needing this
+metadata must reject its absence explicitly; other plugins can ignore it.
+`RunRequest.workspace_dependencies` lists explicitly selected dependency paths,
+POSIX-relative to that origin. This metadata lets a plugin distinguish dependency
+files from prepared experiment files, including overlaps and single-file targets,
+when relocating the experiment. Its default is an empty tuple for older callers.
 Keep a durable handle for every potentially accepted submission and never
 automatically submit missing instances after partial submission failure.
 Supplying any registered plugin CLI option also selects its backend.

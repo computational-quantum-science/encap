@@ -65,6 +65,8 @@ class RunRequest:
     interpreter: Optional[str] = None
     workspace_folder: Optional[Path] = None
     experiment_path: str = "."
+    workspace_origin: Optional[Path] = None
+    workspace_dependencies: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

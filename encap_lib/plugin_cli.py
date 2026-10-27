@@ -258,9 +258,16 @@ def dispatch(pargs, registrations, get_script_name):
         run_overrides.update(backend=name, script_name=entrypoint)
         write_run_configuration(destination, effective, run_overrides)
         workspace, experiment_path = stage_workspace(source_dir, destination, dependencies, excluded)
+        workspace_origin = source_dir.resolve()
+        for _ in Path(experiment_path).parts:
+            workspace_origin = workspace_origin.parent
         request = RunRequest(destination, entrypoint, arguments, dict(environment), pargs.name, writer.directory,
                              effective.get("interpreter"),
-                             workspace_folder=workspace, experiment_path=experiment_path)
+                             workspace_folder=workspace, experiment_path=experiment_path,
+                             workspace_origin=workspace_origin,
+                             workspace_dependencies=tuple(
+                                 path.relative_to(workspace_origin).as_posix() for path in dependencies
+                             ))
         handle = backend.submit(request, writer)
         writer.save_handle(handle, confirmed=True)
     except (BackendError, OSError, KeyboardInterrupt) as error:

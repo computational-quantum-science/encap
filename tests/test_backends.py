@@ -621,6 +621,7 @@ def test_submit_receives_prepared_run_folder_and_configuration(cli, tmp_path, mo
     def submit(request, writer):
         assert request.run_folder == expected
         assert request.record_dir == expected / ".encap-run"
+        assert request.workspace_origin == source.resolve()
         assert not hasattr(request, "source_dir")
         assert not hasattr(request, "source_files")
         assert not hasattr(request, "exclude")
@@ -696,6 +697,8 @@ def test_dependency_workspace_reaches_supporting_plugin(cli, tmp_path, monkeypat
     request = backend.submit.call_args.args[0]
     assert request.experiment_path == "experiment"
     assert request.workspace_folder == request.record_dir / "workspace"
+    assert request.workspace_origin == tmp_path.resolve()
+    assert request.workspace_dependencies == ("src",)
     assert (request.workspace_folder / "src/data.txt").read_text() == "snapshot"
     assert (request.workspace_folder / "experiment/.encap_history.conf").is_file()
     backend.pull.assert_called_once_with(backend.submit.return_value, request.run_folder)
