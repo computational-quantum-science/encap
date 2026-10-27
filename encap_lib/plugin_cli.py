@@ -156,7 +156,7 @@ def dispatch(pargs, registrations, get_script_name):
     project = effective.get("projects", {}).get(os.getcwd(), {})
     if not isinstance(project, dict):
         raise ConfigurationError("Project configuration must be a mapping")
-    for key in ("backend", "plugins", "backup_on_overwrite", "dependencies"):
+    for key in ("backend", "plugins", "backup_on_overwrite", "dependencies", "workspace_root"):
         if key in project:
             value = {key: project[key]}
             settings.merge_dicts(effective, value)
@@ -217,12 +217,18 @@ def dispatch(pargs, registrations, get_script_name):
         if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
             raise ConfigurationError(f"{key} must be a list of patterns")
         excluded.extend(values)
-    dependencies = resolve_dependencies(effective.get("dependencies", []), source_dir, excluded)
+    workspace_root = (
+        settings.resolve_workspace_root(effective["workspace_root"]) if "workspace_root" in effective else None
+    )
+    dependencies = resolve_dependencies(
+        effective.get("dependencies", []), source_dir, excluded, workspace_root=workspace_root,
+    )
     if dependencies and not registration.supports_dependencies:
         raise ConfigurationError(f"Backend {name} does not support dependencies")
     namespace = effective.get("plugins", {}).get(name, PluginConfig())
     if not isinstance(namespace, PluginConfig):
         namespace = PluginConfig(namespace)
+    namespace.workspace_root = workspace_root
     backend = registration.factory(namespace)
     if replacement is not None and not pargs.yes:
         action = (

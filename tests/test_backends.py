@@ -704,6 +704,47 @@ def test_dependency_workspace_reaches_supporting_plugin(cli, tmp_path, monkeypat
     backend.pull.assert_called_once_with(backend.submit.return_value, request.run_folder)
 
 
+@pytest.mark.parametrize("scope", ["global", "project", "local"])
+def test_top_level_workspace_root_reaches_plugin_and_snapshot(cli, tmp_path, monkeypatch, scope):
+    module, factory, backend = cli
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/value.txt").write_text("root dependency")
+    root = str(tmp_path.resolve())
+    text = 'dependencies: ["{root}/src"]\n'
+    if scope == "local":
+        text += "workspace_root: ..\n"
+    elif scope == "global":
+        settings.config["workspace_root"] = root
+    else:
+        settings.config["projects"] = {str(tmp_path): {"workspace_root": root}}
+    (tmp_path / "experiment/.encap.conf").write_text(text)
+    registration = Registration("fake", factory, ("-fake",), supports_dependencies=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    namespace = factory.call_args.args[0]
+    assert namespace.workspace_root == tmp_path.resolve()
+    assert "workspace_root" not in namespace
+    request = backend.submit.call_args.args[0]
+    assert request.workspace_dependencies == ("src",)
+    assert (request.workspace_folder / "src/value.txt").read_text() == "root dependency"
+    history = yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())
+    assert history["workspace_root"] == root
+    assert history["dependencies"] == ["{root}/src"]
+
+
+def test_root_dependency_without_core_root_never_prepares_or_submits(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    (tmp_path / "experiment/.encap.conf").write_text('dependencies: ["{root}/src"]\n')
+    registration = Registration("fake", factory, ("-fake",), supports_dependencies=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+    assert not (tmp_path / "0encap_folder").exists()
+
+
 @pytest.mark.parametrize("backend_flag", [[], ["-fake"]])
 def test_dependencies_reject_unsupported_backends(cli, tmp_path, monkeypatch, backend_flag):
     module, factory, backend = cli

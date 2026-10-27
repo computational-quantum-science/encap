@@ -37,6 +37,7 @@ class PluginConfig(dict):
     def __init__(self, values=(), origin=None):
         super().__init__()
         self.origins = {}
+        self.workspace_root: Optional[Path] = None
         for key, value in dict(values).items():
             self[key] = PluginConfig(value, origin) if isinstance(value, dict) else value
             self.origins[key] = origin

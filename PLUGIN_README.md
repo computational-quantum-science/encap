@@ -63,7 +63,8 @@ plugins:
     provider_setting: value
 ```
 
-Core passes only the selected namespace to the plugin. Each plugin documents
+Core passes only the selected namespace to the plugin, with the shared
+`workspace_root` available as namespace metadata. Each plugin documents
 its own settings and validates them. A saved run always selects its recorded
 backend and settings, even after configuration changes. Omit selectors on
 management commands. Keep the run folder's `.encap-run` metadata when moving
@@ -81,8 +82,29 @@ dependencies:
   - ../shared_experiment
 ```
 
-Entries select files or directories, relative to the configuration file declaring
-the list, including inherited/global configuration. A child list replaces the
+For paths relative to a project root, configure the generic top-level
+`workspace_root`:
+
+```yaml
+workspace_root: /Users/alcalde/projects
+dependencies:
+  - "{root}/encap_experiemnts/src"
+```
+
+`workspace_root` may also be relative to its declaring configuration file.
+It follows normal global/project/local configuration inheritance; a child value
+overrides its parent. The effective root must be an existing directory other
+than the filesystem root. `{root}/` is expanded only at the start of dependency
+paths and requires this top-level setting. Quote these entries in YAML.
+Empty paths, `.`/`..` components and unknown/misplaced placeholders are rejected.
+Ordinary relative and absolute dependencies keep their existing meanings.
+Dataproc also uses this root for GCS input destinations, worker paths and mirrored
+storage. Legacy `plugins.dataproc.workspace_root` remains supported, but if both
+settings are present they must resolve to the same directory.
+
+Entries select files or directories. Plain relative paths resolve from the
+configuration file declaring the list, including inherited/global configuration.
+A child list replaces the
 parent list; `dependencies: []` clears it. Only the selected source and dependencies
 are copied. Their common ancestor determines their layout, not what gets copied.
 Dependencies are snapshots, not executed experiments; their own dependency lists
@@ -223,7 +245,10 @@ when relocating the experiment. Its default is an empty tuple for older callers.
 Keep a durable handle for every potentially accepted submission and never
 automatically submit missing instances after partial submission failure.
 Supplying any registered plugin CLI option also selects its backend.
-The factory receives only `plugins.example` from Encap's existing configuration.
+The factory receives a `PluginConfig` mapping containing only `plugins.example`.
+Its `workspace_root` attribute is the resolved top-level root (`Path` or `None`),
+not an injected plugin setting. Backends may use this shared metadata without
+accepting additional keys in their own configuration namespace.
 Use `config.resolve_path("key")` for local configuration-relative paths.
 
 **Save recovery information before submission:** call

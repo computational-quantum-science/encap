@@ -24,12 +24,24 @@ def _excluded(path, relative, patterns):
     )
 
 
-def resolve_dependencies(values, source_dir, excluded):
+def resolve_dependencies(values, source_dir, excluded, workspace_root=None):
     if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
         raise ConfigurationError("dependencies must be a list of nonempty path strings")
     paths = []
     for value in values:
-        path = Path(value).expanduser()
+        if value.startswith("{root}/"):
+            relative = value[len("{root}/"):]
+            if (any(part in ("", ".", "..") for part in relative.split("/"))
+                    or any(char in relative for char in "{}\\")):
+                raise ConfigurationError(f"Invalid root-relative dependency path: {value!r}")
+            if workspace_root is None:
+                raise ConfigurationError("{root} dependencies require top-level workspace_root")
+            root = settings.resolve_workspace_root(str(workspace_root))
+            path = root / relative
+        elif "{" in value or "}" in value:
+            raise ConfigurationError(f"Unknown or misplaced dependency placeholder: {value!r}; use {{root}}/path")
+        else:
+            path = Path(value).expanduser()
         if not path.is_absolute():
             origin = getattr(values, "origin", None)
             if origin is None:

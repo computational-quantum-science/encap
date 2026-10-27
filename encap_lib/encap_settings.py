@@ -15,6 +15,18 @@ class DependencyPaths(list):
         self.origin = origin
 
 
+def resolve_workspace_root(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError("workspace_root must be a nonempty path string")
+    root = Path(value).expanduser()
+    if not root.is_absolute():
+        raise ConfigurationError("Relative workspace_root requires a declaring configuration file")
+    root = root.resolve()
+    if not root.is_dir() or root == Path(root.anchor):
+        raise ConfigurationError("workspace_root must be an existing non-filesystem-root directory")
+    return root
+
+
 def read_terminal_arguments(pargs):
     global args_config, config, using_slurm, using_pueue
 
@@ -79,6 +91,10 @@ def read_config_file(file_name):
                 if not isinstance(value, list) or any(not isinstance(path, str) or not path.strip() for path in value):
                     raise ConfigurationError(f"{file_name}: dependencies must be a list of nonempty path strings")
                 mapping[key] = DependencyPaths(value, str(Path(file_name).resolve().parent))
+            elif key == "workspace_root":
+                if not isinstance(value, str) or not value.strip():
+                    raise ConfigurationError(f"{file_name}: workspace_root must be a nonempty path string")
+                mapping[key] = str(PluginConfig({key: value}, Path(file_name).resolve().parent).resolve_path(key))
             elif isinstance(value, dict):
                 plugin_namespaces(value)
     plugin_namespaces(config_)
