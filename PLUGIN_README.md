@@ -256,6 +256,13 @@ Use `config.resolve_path("key")` for local configuration-relative paths.
 settings before a request could be accepted. Return the confirmed handle afterward.
 Handles must be JSON-serializable; never include credentials or access tokens.
 
+A backend can mark the local record with `writer.update(state="not-submitted")`
+while it is certain that no submission request has started. With no saved handle,
+this allows an explicit `run` retry after local overwrite confirmation.
+`save_handle` ends this retryable phase; never leave `not-submitted` without a
+handle when a remote request could have been accepted. This is a local record
+state, not a `RunStatus` state.
+
 On reconnect the factory receives empty configuration. Use the saved handle,
 not current defaults. Reconcile uncertain submissions without automatically
 resubmitting; updates to `handle.data` are persisted by core.

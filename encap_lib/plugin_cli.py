@@ -15,7 +15,7 @@ from encap_lib import encap_settings as settings
 from encap_lib.run_preparation import resolve_dependencies, stage_source, stage_workspace, write_run_configuration
 from encap_lib.backends import (
     BackendError, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
-    RunHandle, RunRequest, RunStatus, exit_code, wait,
+    RunHandle, RunRequest, RunStatus, exit_code, validate_pull_exclusions, wait,
 )
 
 MANAGEMENT = frozenset(("wait", "tail", "pull", "status", "kill"))
@@ -86,21 +86,26 @@ def dispatch(pargs, registrations, get_script_name):
     if writer is not None and writer.directory.exists() and pargs.mode == "run":
         record = writer.read()
         _check_options(pargs, {})
-        if record["state"] == "submission-unconfirmed" or record["handle"] is None:
-            raise MonitoringError("Cannot overwrite an unconfirmed submission. Reconcile it before submitting again.")
-        previous = _registration(record["backend"], registrations).factory(PluginConfig())
-        handle = RunHandle(**record["handle"])
-        try:
-            status = previous.status(handle)
-            if not isinstance(status, RunStatus):
-                raise MonitoringError("Backend returned an invalid status")
-            writer.update(handle=asdict(handle), computation=asdict(status), monitoring_error=None)
-        except BackendError as error:
-            writer.update(monitoring_error=str(error))
-            raise
-        if status.state not in ("succeeded", "failed", "cancelled"):
-            raise MonitoringError(f"Cannot overwrite a {status.state} run. Wait for confirmed completion first.")
-        replacement = writer.read()
+        if record["state"] == "not-submitted" and record["handle"] is None:
+            replacement = record
+            replacement_state = "not submitted"
+        else:
+            if record["state"] == "submission-unconfirmed" or record["handle"] is None:
+                raise MonitoringError("Cannot overwrite an unconfirmed submission. Reconcile it before submitting again.")
+            previous = _registration(record["backend"], registrations).factory(PluginConfig())
+            handle = RunHandle(**record["handle"])
+            try:
+                status = previous.status(handle)
+                if not isinstance(status, RunStatus):
+                    raise MonitoringError("Backend returned an invalid status")
+                writer.update(handle=asdict(handle), computation=asdict(status), monitoring_error=None)
+            except BackendError as error:
+                writer.update(monitoring_error=str(error))
+                raise
+            if status.state not in ("succeeded", "failed", "cancelled"):
+                raise MonitoringError(f"Cannot overwrite a {status.state} run. Wait for confirmed completion first.")
+            replacement = writer.read()
+            replacement_state = status.state
     if writer is not None and writer.directory.exists() and pargs.mode != "run":
         record = writer.read()
         _check_options(pargs, {})
@@ -110,8 +115,13 @@ def dispatch(pargs, registrations, get_script_name):
             raise ConfigurationError("Saved runs select their backend from the record; omit backend selectors")
         registration = _registration(record["backend"], registrations)
         if record["handle"] is None:
+            if record["state"] == "not-submitted":
+                raise MonitoringError("Run was not submitted; use run to retry.")
             raise MonitoringError("Submission is unconfirmed and no recovery handle was saved. Do not resubmit this run.")
-        backend = registration.factory(PluginConfig())
+        namespace = PluginConfig()
+        if getattr(pargs, "rsync_exclude_pull", None) is not None:
+            namespace.rsync_exclude_pull = validate_pull_exclusions(pargs.rsync_exclude_pull)
+        backend = registration.factory(namespace)
         handle = RunHandle(**record["handle"])
         try:
             if pargs.mode == "wait":
@@ -125,10 +135,14 @@ def dispatch(pargs, registrations, get_script_name):
             if pargs.mode == "status":
                 status = backend.status(handle)
                 writer.update(handle=asdict(handle), computation=asdict(status), monitoring_error=None)
-                print(json.dumps({
+                result = {
                     "state": status.state, "exit_code": status.exit_code, "details": status.details,
                     "outputs_finalized": status.outputs_finalized, "cleanup_pending": status.cleanup_pending,
-                }, indent=2))
+                }
+                retrieval = writer.read_retrieval()
+                if retrieval is not None:
+                    result["retrieval"] = retrieval
+                print(json.dumps(result, indent=2))
                 if status.state == "unknown":
                     raise MonitoringError(f"Remote state is unknown: {status.details}")
             elif pargs.mode == "tail":
@@ -156,7 +170,8 @@ def dispatch(pargs, registrations, get_script_name):
     project = effective.get("projects", {}).get(os.getcwd(), {})
     if not isinstance(project, dict):
         raise ConfigurationError("Project configuration must be a mapping")
-    for key in ("backend", "plugins", "backup_on_overwrite", "dependencies", "workspace_root"):
+    for key in ("backend", "plugins", "backup_on_overwrite", "dependencies", "workspace_root",
+                "rsync_exclude_pull"):
         if key in project:
             value = {key: project[key]}
             settings.merge_dicts(effective, value)
@@ -229,6 +244,7 @@ def dispatch(pargs, registrations, get_script_name):
     if not isinstance(namespace, PluginConfig):
         namespace = PluginConfig(namespace)
     namespace.workspace_root = workspace_root
+    namespace.rsync_exclude_pull = validate_pull_exclusions(effective.get("rsync_exclude_pull", []))
     backend = registration.factory(namespace)
     if replacement is not None and not pargs.yes:
         action = (
@@ -236,7 +252,7 @@ def dispatch(pargs, registrations, get_script_name):
             if backup_on_overwrite else "Overwrite it? The previous local run will be deleted."
         )
         answer = input(
-            f"The experiment {destination} already exists ({status.state}). "
+            f"The experiment {destination} already exists ({replacement_state}). "
             f"{action} y/n: "
         )
         if answer.strip().lower() != "y":

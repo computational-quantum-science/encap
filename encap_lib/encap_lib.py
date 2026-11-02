@@ -51,6 +51,8 @@ def get_machine(vm, local_project_dir):
         for key in copy_dict_keys:
             if settings_project[key] is not None:
                 ssh_kwargs[key] = settings_project[key]
+        if "rsync_exclude_pull" in settings.args_config:
+            ssh_kwargs["rsync_exclude_pull"] = list(settings.args_config["rsync_exclude_pull"])
 
         remote_project_dir = settings_project["dir"]
         ip = settings_project["ip"]

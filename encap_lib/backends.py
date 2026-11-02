@@ -31,6 +31,14 @@ class MonitoringError(BackendError):
     pass
 
 
+def validate_pull_exclusions(values):
+    if (not isinstance(values, list)
+            or any(not isinstance(value, str) or not value.strip()
+                   or any(ord(char) < 32 or ord(char) == 127 for char in value) for value in values)):
+        raise ConfigurationError("rsync_exclude_pull must be a list of nonempty patterns without control characters")
+    return list(values)
+
+
 class PluginConfig(dict):
     """A namespace whose path values retain their declaring configuration directory."""
 
@@ -38,6 +46,7 @@ class PluginConfig(dict):
         super().__init__()
         self.origins = {}
         self.workspace_root: Optional[Path] = None
+        self.rsync_exclude_pull: Optional[List[str]] = None
         for key, value in dict(values).items():
             self[key] = PluginConfig(value, origin) if isinstance(value, dict) else value
             self.origins[key] = origin
@@ -230,7 +239,7 @@ class RecordWriter:
         })
         return writer
 
-    def _write(self, data):
+    def _write(self, data, path=None):
         try:
             encoded = json.dumps(data, indent=2, allow_nan=False) + "\n"
         except (TypeError, ValueError) as error:
@@ -241,7 +250,7 @@ class RecordWriter:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            os.replace(temporary, self.path if path is None else path)
             directory_fd = os.open(str(self.directory), os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
@@ -283,3 +292,44 @@ class RecordWriter:
 
     def save_status(self, status: RunStatus):
         self.update(computation=asdict(status), monitoring_error=None)
+
+    def read_retrieval(self):
+        path = self.directory / "retrieval.json"
+        if path.is_symlink():
+            raise BackendError(f"Retrieval record must not be a symlink: {path}")
+        try:
+            with path.open() as stream:
+                record = json.load(stream)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise BackendError(f"Cannot read retrieval record {path}: {error}") from error
+        if (not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1
+                or not isinstance(record.get("sources"), dict)):
+            raise BackendError(f"Invalid retrieval record: {path}")
+        for source, details in record["sources"].items():
+            if (not isinstance(source, str) or not isinstance(details, dict)
+                    or details.get("state") not in ("in_progress", "succeeded", "failed")
+                    or details.get("scope") not in ("full", "partial")
+                    or not isinstance(details.get("omitted"), list)
+                    or not isinstance(details.get("previous_omissions"), list)):
+                raise BackendError(f"Invalid retrieval record: {path}")
+            if any(not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"]
+                   for item in details["omitted"] + details["previous_omissions"]):
+                raise BackendError(f"Invalid retrieval record omissions: {path}")
+        return record
+
+    def save_retrieval(self, source, details):
+        try:
+            for path in (self.directory, *self.directory.parents):
+                if path.is_symlink():
+                    raise BackendError(f"Retrieval record path must not traverse a symlink: {path}")
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with FileLock(str(self.directory / "retrieval.lock")):
+                record = self.read_retrieval()
+                if record is None:
+                    record = {"version": 1, "sources": {}}
+                record["sources"][source] = details
+                self._write(record, self.directory / "retrieval.json")
+        except OSError as error:
+            raise BackendError(f"Cannot save retrieval record: {error}") from error

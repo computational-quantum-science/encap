@@ -4,7 +4,7 @@ import sys
 import encap_lib
 import copy
 from pathlib import Path
-from encap_lib.backends import ConfigurationError, PluginConfig
+from encap_lib.backends import ConfigurationError, PluginConfig, validate_pull_exclusions
 
 
 class DependencyPaths(list):
@@ -63,6 +63,9 @@ def read_terminal_arguments(pargs):
     
     if pargs.interpreter is not None:
         args_config["interpreter"] = pargs.interpreter
+
+    if getattr(pargs, "rsync_exclude_pull", None) is not None:
+        args_config["rsync_exclude_pull"] = validate_pull_exclusions(pargs.rsync_exclude_pull)
     
     config = merge_dicts(config, copy.deepcopy(args_config))
 

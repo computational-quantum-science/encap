@@ -2,6 +2,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import json
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +155,151 @@ def invoke(cli, monkeypatch, *arguments):
     return cli.main()
 
 
+@pytest.mark.parametrize("arguments,expected", [
+    ([], ["configured/"]),
+    (["--rsync-exclude-pull"], []),
+    (["--rsync-exclude-pull", "*.pkl", "models/"], ["*.pkl", "models/"]),
+    (["--rsync-exclude-pull", "*.pkl", "--rsync-exclude-pull", "models/"], ["*.pkl", "models/"]),
+])
+def test_shared_pull_exclusions_reach_plugin_and_saved_configuration(cli, monkeypatch, arguments, expected):
+    module, factory, backend = cli
+    source = Path("experiment")
+    (source / ".encap.conf").write_text("rsync_exclude_pull: ['configured/']\n")
+    (source / "model.pkl").write_bytes(b"source model")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake", *arguments)
+    namespace = factory.call_args.args[0]
+    assert namespace.rsync_exclude_pull == expected
+    assert "rsync_exclude_pull" not in namespace
+    request = backend.submit.call_args.args[0]
+    assert (request.run_folder / "model.pkl").read_bytes() == b"source model"
+    saved = yaml.safe_load((request.run_folder / ".encap_history.conf").read_text())
+    assert saved["rsync_exclude_pull"] == expected
+
+
+@pytest.mark.parametrize("mode", ["pull", "tail"])
+@pytest.mark.parametrize("arguments,expected", [
+    ([], None), (["--rsync-exclude-pull"], []),
+    (["--rsync-exclude-pull", "*.pkl"], ["*.pkl"]),
+])
+def test_saved_pull_exclusion_override_does_not_reload_or_modify_policy(
+    cli, tmp_path, monkeypatch, mode, arguments, expected,
+):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    writer = RecordWriter(tmp_path / "0encap_folder/experiment/trial/.encap-run")
+    original = writer.read()["handle"]
+    (tmp_path / "experiment/.encap.conf").write_text("broken: [configuration")
+    invoke(module, monkeypatch, mode, "experiment", "-n", "trial", *arguments)
+    assert factory.call_args.args[0] == {}
+    assert factory.call_args.args[0].rsync_exclude_pull == expected
+    assert writer.read()["handle"] == original
+
+
+@pytest.mark.parametrize("value", ["not-a-list", [""], [1], ["line\nbreak"]])
+def test_invalid_shared_pull_exclusions_fail_before_preparing_run(cli, monkeypatch, value):
+    module, factory, backend = cli
+    Path("experiment/.encap.conf").write_text(yaml.safe_dump({"rsync_exclude_pull": value}))
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+    assert not Path("0encap_folder").exists()
+
+
+@pytest.mark.parametrize("mode", ["wait", "status", "kill", "copy", "rerun", "tar", "untar"])
+def test_pull_exclusion_cli_rejects_unrelated_modes(cli, monkeypatch, mode):
+    module, factory, backend = cli
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, mode, "experiment", "-n", "trial", "--rsync-exclude-pull", "*.pkl")
+    assert result.value.code == 2
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+
+
+def test_project_pull_exclusions_reach_plugin(cli, tmp_path, monkeypatch):
+    module, factory, _ = cli
+    settings.config["rsync_exclude_pull"] = ["global/"]
+    settings.config["projects"] = {str(tmp_path): {"rsync_exclude_pull": ["project/"]}}
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert factory.call_args.args[0].rsync_exclude_pull == ["project/"]
+
+
+def test_main_pull_override_reaches_ssh_without_changing_matching(cli, tmp_path, monkeypatch):
+    from encap_lib.encap_lib import get_machine
+
+    module, _, _ = cli
+    settings.config["projects"] = {str(tmp_path): {"ssh": {"worker": {
+        "ip": "host", "user": "user", "dir": "/remote", "rsync_exclude_pull": ["machine/"],
+    }}}}
+    monkeypatch.setattr(sys, "argv", [
+        "encap", "pull", "experiment", "-n", "trial",
+        "--rsync-exclude-pull", "*.pkl", "it's.pkl",
+    ])
+    module.parse_arguments()
+    machine = get_machine("worker", str(tmp_path))
+    assert machine.rsync_exclude_pull == ["*.pkl", "it's.pkl"]
+    command = Mock()
+    monkeypatch.setattr("encap_lib.machines.run_code_local", command)
+    machine.pull("remote", "local")
+    shell = command.call_args.args[0]
+    assert "--exclude " + shlex.quote("*.pkl") in shell
+    assert "--exclude " + shlex.quote("it's.pkl") in shell
+
+
+def test_retrieval_receipts_are_atomic_and_separate_from_recovery(tmp_path, monkeypatch):
+    writer = RecordWriter.reserve(tmp_path / "run", Registration("fake", Mock()), "run")
+    original = writer.path.read_bytes()
+    details = {"state": "succeeded", "scope": "partial", "omitted": [{"path": "model.pkl"}],
+               "previous_omissions": []}
+    writer.save_retrieval("gs://bucket/output/", details)
+    receipt = writer.directory / "retrieval.json"
+    saved = receipt.read_bytes()
+    replace = backends.os.replace
+
+    def fail_receipt(source, destination):
+        if destination == receipt:
+            raise OSError("disk unavailable")
+        replace(source, destination)
+
+    monkeypatch.setattr(backends.os, "replace", fail_receipt)
+    with pytest.raises(BackendError, match="Cannot save retrieval"):
+        writer.save_retrieval("gs://bucket/output/", dict(details, scope="full", omitted=[]))
+    assert receipt.read_bytes() == saved
+    assert writer.path.read_bytes() == original
+    assert not list(writer.directory.glob("record-*.tmp"))
+
+
+@pytest.mark.parametrize("contents", [
+    "broken json", "[]", '{"version": true, "sources": {}}',
+    '{"version": 1, "sources": {"gs://bucket/": {"state": "succeeded", "scope": "full", '
+    '"omitted": [1], "previous_omissions": []}}}',
+])
+def test_invalid_retrieval_receipts_are_not_silently_ignored(tmp_path, contents):
+    (tmp_path / "retrieval.json").write_text(contents)
+    with pytest.raises(BackendError, match="retrieval"):
+        RecordWriter(tmp_path).read_retrieval()
+
+
+def test_status_reports_retrieval_separately_from_remote_success(cli, tmp_path, monkeypatch, capsys):
+    module, _, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    writer = RecordWriter(tmp_path / "0encap_folder/experiment/trial/.encap-run")
+    original = writer.read()
+    writer.save_retrieval("gs://bucket/output/", {
+        "state": "succeeded", "scope": "partial",
+        "omitted": [{"path": "model.pkl"}], "previous_omissions": [],
+    })
+    assert writer.read() == original
+    backend.status.return_value = RunStatus("succeeded", outputs_finalized=True)
+    capsys.readouterr()
+    invoke(module, monkeypatch, "status", "experiment", "-n", "trial")
+    status = json.loads(capsys.readouterr().out)
+    assert status["state"] == "succeeded"
+    assert status["outputs_finalized"] is True
+    assert status["retrieval"]["sources"]["gs://bucket/output/"]["scope"] == "partial"
+
+
 def test_plugin_lifecycle_uses_saved_handle(cli, tmp_path, monkeypatch, capsys):
     module, factory, backend = cli
     (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    bucket: original\n")
@@ -283,6 +429,52 @@ def test_uncertain_submission_preserves_intent(cli, tmp_path, monkeypatch):
     invoke(module, monkeypatch, "tail", "experiment", "-n", "trial")
     backend.tail.assert_called_once_with(RunHandle({"request_id": "known-before-request"}))
     assert backend.submit.call_count == 1
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_pre_submission_failure_can_be_retried(cli, tmp_path, monkeypatch, automatic):
+    module, _, backend = cli
+    def submit(request, writer):
+        writer.update(state="not-submitted")
+        raise BackendError("Cloud run unchanged; deletion was not approved")
+    backend.submit.side_effect = submit
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    writer = RecordWriter(tmp_path / "0encap_folder/experiment/trial/.encap-run")
+    assert writer.read()["state"] == "not-submitted"
+    assert writer.read()["handle"] is None
+    assert "deletion was not approved" in writer.read()["submission_error"]
+    backend.submit.side_effect = None
+    backend.status.side_effect = AssertionError("no remote submission to inspect")
+    prompt = Mock(return_value="y")
+    monkeypatch.setattr("builtins.input", prompt)
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", *(["-y"] if automatic else []))
+    assert prompt.call_count == (0 if automatic else 1)
+    if not automatic:
+        assert "(not submitted)" in prompt.call_args.args[0]
+    assert writer.read()["state"] == "submitted"
+    assert backend.submit.call_count == 2
+    backend.status.assert_not_called()
+    backend.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["status", "wait", "tail", "pull", "kill"])
+def test_not_submitted_run_has_no_remote_management(cli, tmp_path, monkeypatch, capsys, mode):
+    module, _, backend = cli
+    writer = RecordWriter.reserve(
+        tmp_path / "0encap_folder/experiment/trial", Registration("fake", Mock()), "trial",
+    )
+    writer.update(state="not-submitted")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, mode, "experiment", "-n", "trial")
+    assert result.value.code == 2
+    assert "not submitted" in capsys.readouterr().err
+    backend.submit.assert_not_called()
+    backend.status.assert_not_called()
+    backend.tail.assert_not_called()
+    backend.pull.assert_not_called()
+    backend.cancel.assert_not_called()
 
 
 def test_missing_plugin_and_unsupported_mode(cli, tmp_path, monkeypatch):
@@ -522,13 +714,18 @@ def test_declining_overwrite_preserves_existing_run(cli, tmp_path, monkeypatch):
     assert not list(destination.parent.glob("trial.backup-*"))
 
 
-@pytest.mark.parametrize("state", ["submitted", "running", "unknown", "unconfirmed", "offline"])
+@pytest.mark.parametrize("state", [
+    "submitted", "running", "unknown", "unconfirmed", "offline", "not-submitted-with-handle",
+])
 def test_unsafe_overwrite_is_rejected_even_with_yes(cli, tmp_path, monkeypatch, state):
     module, factory, backend = cli
     invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
     destination = tmp_path / "0encap_folder" / "experiment" / "trial"
     if state == "unconfirmed":
         RecordWriter(destination / ".encap-run").update(state="submission-unconfirmed")
+    elif state == "not-submitted-with-handle":
+        RecordWriter(destination / ".encap-run").update(state="not-submitted")
+        backend.status.return_value = RunStatus("running")
     elif state == "offline":
         backend.status.side_effect = MonitoringError("offline")
     else:

@@ -538,6 +538,10 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     parser.add_argument("-i", "--number_of_instances", dest="i", help="Specify the number of instances to initiate concurrently. Each instance will have an associated environment variable, ENCAP_PROCID=<instance_number>. This option accepts either an integer, list or a Python expression in string format. When a list is provided, instances corresponding to the list items are initiated. Examples: -i '[0, 2, 3]' or -i 'range(5, 20)'. This feature is similar to -sl_i in Slurm mode.", default=None, type=eval)
     parser.add_argument("-int", "--interpreter", dest="interpreter", help="Specify the interpreter. If not provided, it's inferred from the file extension.", default=None)
     parser.add_argument("-tar_cpus", "--tar_cpus", dest="tar_cpus", help="Number of cpus to use when tarring several experiments. Default is 1.", default=1, type=int)
+    parser.add_argument("--rsync-exclude-pull", dest="rsync_exclude_pull", nargs="*", action="extend",
+                        default=None, metavar="PATTERN",
+                        help="Override pull exclusions for run, tail or pull; quote globs such as '*.pkl'. "
+                             "Supply no patterns to pull all outputs; omit the flag to use configured/saved exclusions.")
 
     # Slurm arguments
     parser.add_argument("-sl", "--slurm", action="store_true", dest="slurm", help="Flag to run the job on Slurm. If any Slurm option is used, this flag is automatically set to True.", default=False)
@@ -572,6 +576,8 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     backends.register_selectors(parser, registrations)
     pargs = parser.parse_args()
     pargs.registrations = registrations
+    if pargs.rsync_exclude_pull is not None and pargs.mode not in ("run", "tail", "pull"):
+        raise backends.ConfigurationError("--rsync-exclude-pull requires run, tail or pull")
 
     # Read the data in
     if pargs.debug:

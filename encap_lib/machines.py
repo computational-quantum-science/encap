@@ -1,4 +1,5 @@
 import subprocess
+import shlex
 import threading
 from multiprocessing.pool import ThreadPool
 import os
@@ -214,7 +215,7 @@ class SSHMachine(Machine):
         options = "--update " + options
 
         for exclude in self.rsync_exclude_pull:
-            options = f"--exclude '{exclude}' " + options
+            options = f"--exclude {shlex.quote(exclude)} " + options
 
         default_ignore = self.ssh_ignore + [
             "sending incremental", "receiving incremental",
