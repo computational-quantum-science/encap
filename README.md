@@ -6,10 +6,6 @@
 
 Encap is a user-friendly tool designed to help you manage and keep track of your computational experiments, especially in the field of scientific computing. With Encap, you can easily run various experiments in separate containers and maintain a record of the results.
 
-Want to add an execution backend? See the brief [plugin author guide](PLUGIN_README.md).
-For Dataproc source snapshots that preserve sibling-folder paths, see
-[source dependencies](PLUGIN_README.md#source-dependencies).
-
 ## Features
 
 Encap currently supports:
@@ -19,7 +15,7 @@ Encap currently supports:
 - Running multiple experiments in parallel
 - Running experiments on a cluster with Slurm or Pueue
 - Running experiments remotely via SSH
-- Automatically pulling cloud outputs in the background every 60 seconds
+- [Plugin support](PLUGIN_README.md#source-dependencies): [gcp dataproc](https://github.com/danielalcalde/encap-dataproc)
 
 Note that Encap is currently only compatible with Linux/macOS.
 
