@@ -77,6 +77,7 @@ class RunRequest:
     experiment_path: str = "."
     workspace_origin: Optional[Path] = None
     workspace_dependencies: Tuple[str, ...] = ()
+    source_path: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -100,10 +101,14 @@ class RunStatus:
 
 class Backend(Protocol):
     def submit(self, request: RunRequest, writer: "RecordWriter") -> RunHandle: ...
+    def rerun(self, request: RunRequest, handle: RunHandle, writer: "RecordWriter") -> RunHandle: ...
     def status(self, handle: RunHandle) -> RunStatus: ...
     def tail(self, handle: RunHandle) -> None: ...
     def pull(self, handle: RunHandle, destination: Path) -> None: ...
+    def sync(self, handle: RunHandle, destination: Path, final: bool = False) -> None: ...
     def cancel(self, handle: RunHandle) -> None: ...
+    def ssh(self, handle: RunHandle, instance: Optional[int] = None,
+            tunnel_through_iap: bool = False) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,10 @@ class Registration:
     plugin_version: str = "unknown"
     cli_options: Tuple[CLIOption, ...] = ()
     supports_dependencies: bool = False
+    list_runs: Optional[Callable[[PluginConfig], List[RunStatus]]] = None
+    supports_rerun: bool = False
+    supports_autopull: bool = False
+    supports_ssh: bool = False
 
 
 def discover() -> Dict[str, Registration]:
@@ -147,6 +156,8 @@ def discover() -> Dict[str, Registration]:
             raise ConfigurationError(f"Invalid backend name: {registration.name!r}")
         if registration.name in registrations:
             raise ConfigurationError(f"Duplicate backend name: {registration.name}")
+        if registration.list_runs is not None and not callable(registration.list_runs):
+            raise ConfigurationError(f"Invalid run listing callback for {registration.name}")
         keys = set()
         for option in registration.cli_options:
             if (not isinstance(option, CLIOption) or not option.flags

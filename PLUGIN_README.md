@@ -16,7 +16,48 @@ encap tail ./experiment -n trial
 encap status ./experiment -n trial
 encap pull ./experiment -n trial
 encap kill ./experiment -n trial
+encap ssh ./experiment -n trial
 ```
+
+`ssh` opens an interactive terminal on a supporting backend's saved run.
+Dataproc connects to the actual master instance discovered from its workflow
+and cluster, using the saved project/region rather than current configuration.
+For multi-instance runs, select an ID with `--instance ID`; add
+`--tunnel-through-iap` when an IAP tunnel is required. Run `htop` after connecting.
+Exiting or interrupting SSH does not cancel the experiment or pull outputs.
+SSH requires the local `.encap-run` record and a live, provisioned cluster.
+
+For backends supporting cloud discovery, omit `-n` to list active jobs directly
+from the provider, even without local run records:
+
+```sh
+encap status ./experiment -gcp
+encap status ./experiment       # infer the only configured listing backend
+encap status -gcp               # use configuration from the current directory
+```
+
+An explicit selector or configured `backend` takes precedence. Otherwise Encap
+selects the only installed listing-capable backend with a namespace in `plugins`;
+multiple candidates require a selector. Native VM/Slurm/Pueue selection disables
+this inference. The target supplies configuration, not an experiment-name filter:
+Dataproc lists active Encap jobs visible to the selected identity in the configured
+project and region, filtering by the `encap-request-id` label and ignoring jobs
+submitted by other tools. No dependency staging or submission validation is
+performed. Listings use a compact Pueue-style table with experiment source path,
+run name, status, elapsed time in the current state and cluster. Elapsed time is
+shown as `02h 15m 03s` (with a day count for runs lasting at least a day);
+missing timestamps display `-`. Raw timestamps remain available with `--json`.
+Source paths and
+names come from the job's saved GCS request metadata, including for existing runs
+without local records; the selected identity needs read access to that metadata.
+Long paths and names wrap instead of being truncated. Empty listings print `No active jobs.`
+Use `encap status ./experiment -gcp --json` for the full machine-readable output
+with `backend` and a `runs` list of serialized `RunStatus` values, including links
+and provider details; an empty JSON listing has `runs: []`.
+Provider/authentication/partial-listing errors fail with code 2 rather than
+appearing as an empty result. Other plugins can opt into this capability as
+described below.
+Named-run status (`-n`) retains its detailed JSON output.
 
 Backends can register their own CLI options. For example, Dataproc owns
 `-gcp_i`; like Slurm's `-sl_i`, it accepts a count, explicit IDs or a range:
@@ -39,10 +80,11 @@ submission, output merging and recovery behavior.
 
 Only explicitly selected plugin runs (a selector or configured `backend`) use
 the plugin interface. Built-in local/SSH/Slurm/Pueue execution remains in place.
-Plugin `run` saves the confirmed submission, then **follows logs automatically**,
+Plugin `run` and supported `rerun` save the confirmed submission, then **follow logs automatically**,
 matching Encap's default run-and-tail behavior. Ctrl-C detaches without cancelling
-the job. Both `run` and reattached `tail` automatically pull outputs when
-log-following finishes normally. Detaching or a tailing error skips the pull.
+the job. `run`, supported `rerun` and reattached `tail` automatically pull outputs when
+log-following finishes normally. Detaching or a tailing error skips that final
+foreground pull, but does not stop independently registered automatic pulls.
 Use `wait` to wait without logs or downloads, and `pull` to download explicitly.
 
 Before calling a plugin, core creates the normal local experiment directory,
@@ -137,21 +179,13 @@ IDs as local OS PIDs or treats disappearance as success. Runs created before
 All recorded instances must complete. Built-in Slurm/Pueue wrappers now preserve
 the computation's exit code rather than masking it with the final log marker.
 
-New built-in runs keep internal metadata in one hidden `.encap-native/`
-directory: `tracking.json` records execution kind and per-instance process/job
-IDs, and `exit` / `exit_<index>` save OS-process exit codes atomically. `tail`
-reads the IDs from tracking, so new runs no longer create a separate `pid` file.
-Keep this directory with the experiment for later `wait` and `tail` commands.
-Existing top-level `.encap-native.json`, `.encap-exit*`, and legacy `pid` files
-remain readable; they are not automatically moved or deleted. When both tracking
-layouts exist, the new layout takes precedence, including its exit results.
-
 CLI exit codes: 0 for confirmed success, a valid remote nonzero code (1-255)
 when available, 1 for failure without a valid code, 130 for cancellation or
 client interrupt, and 2 for configuration/plugin/monitoring errors.
 
 Plugin runs reject conflicting selectors, VM/scheduler/native `-i` options,
-and unsupported rerun/copy/archive/push/dry-run modes before submission.
+and unsupported copy/archive/push/dry-run modes before submission. `rerun`
+requires a backend that explicitly supports it.
 An unconfirmed submission is never automatically resubmitted. Consult the plugin's
 recovery instructions rather than reusing the run name.
 
@@ -205,7 +239,137 @@ appears automatically in `encap --help`.
 callable defaults to `str`; the plugin can supply a converter that validates
 provider-specific syntax and raises `argparse.ArgumentTypeError` on invalid input.
 CLI values override inherited configuration and are preserved in run history.
-Only one backend's options may be supplied, and only for a new `run`.
+Only one backend's options may be supplied, for `run` or a supported `rerun`.
+
+### Rerunning saved experiments
+
+Encap 0.6.2 adds the optional API 3 capability
+`Registration.supports_rerun=True`. Supporting backends implement
+`rerun(request, handle, writer) -> RunHandle`.
+
+```sh
+encap run ./experiment -n trial -gcp_i '[0]'
+encap rerun ./experiment -n trial -sn run.py -gcp_i '[1, 2, 3]'
+```
+
+Core keeps the existing run directory and record. It loads saved configuration,
+applies edits to the run's `.encap.conf` and CLI overrides, and prepares the saved
+experiment files without recopying the original source. Dependency workspaces
+are rebuilt using saved dependency locations; supporting workspace backends also
+apply push exclusions when packaging reruns without dependencies. Legacy runs
+with relative dependency paths need their original declaring configuration, or
+absolute/`{root}/` paths in the saved `.encap.conf`.
+
+The backend receives the previous durable handle and must return a handle that
+retains all unselected instances. New IDs extend the run; selected completed IDs
+may be restarted. Reject selected active, uncertain or cleanup-pending work
+before submitting a replacement, and retain every recovery handle after partial
+failure. `status`, `wait`, `tail`, `pull` and `kill` continue using the combined
+saved handle. Monitoring clients attached before a rerun must reconnect if the
+record changes; they cannot overwrite newer recovery handles.
+
+Dataproc shows only the first instance selected by the latest launch, including
+reruns, and saves that selection for `tail` reattachment. It never mixes logs or
+switches to older instances. After that instance finishes, remaining jobs are
+waited for quietly before the final download. Status, `wait`, downloads and
+cancellation still cover the complete group. Ctrl-C only detaches.
+
+Dataproc implements this capability for mirrored and legacy storage. Rerun does
+not perform a local overwrite or delete the cloud run. Existing output collision
+protection still applies. `-gcp_i 1` is a count (ID 0); use `'[0]'` for explicit
+ID zero. With no selection override, the saved instance configuration is reused.
+
+### Automatic cloud pulls
+
+Encap 0.6.3 adds the optional API 3 capability
+`Registration.supports_autopull=True`. Dataproc supports it. Supporting `run`
+and `rerun` submissions, including partial submissions with saved handles,
+automatically register their local run directory with a per-user daemon.
+It pulls available outputs every **60 seconds** using the saved backend and
+pull exclusions. Local/SSH/Slurm/Pueue behavior is unchanged.
+
+```sh
+encap watch ./experiment -n trial  # register an existing saved cloud run
+encap daemon status               # compact daemon summary and per-run sync table
+encap daemon status --json        # full metadata, paths, timestamps and errors
+encap daemon stop                 # pause and disable automatic restarting
+encap daemon start                # resume all registered runs
+```
+
+The daemon survives terminal closure and Ctrl-C detachment. It watches all
+registered local cloud runs, not unrelated provider jobs with no local record.
+After a run is terminal and cleanup completes, it takes a stable final snapshot
+and stops polling that unchanged handle. The daemon remains available for new
+runs and reruns. `complete` in daemon status describes synchronization, not
+successful computation; `run_state` still reports failed or cancelled jobs.
+Errors are recorded per run and retried on later cycles without blocking
+other runs. `stop` does not cancel remote jobs or discard registrations.
+New submissions remain registered but do not restart an explicitly stopped daemon.
+`watch` explicitly resumes automatic pulls.
+
+State and logs live under `~/.encap/daemon/`; per-run errors and last successful
+sync times appear in `encap daemon status`, and diagnostics in
+`~/.encap/daemon/daemon.log`. After reboot, use `encap daemon start` or a new
+submission to resume; no login/system service is installed. While the machine
+is asleep or offline no downloads occur, and authentication requiring interaction
+must be refreshed in a terminal.
+
+The status table shows each run's name, computation state, synchronization
+state and time since its last successful pull. Internal revisions, fingerprints,
+absolute paths and raw timestamps are omitted; duplicate run names use their
+full paths to remain unambiguous. Errors are summarized below the table.
+Use `--json` for the complete, unchanged status structure.
+
+Supporting backends implement `sync(handle, destination, final=False)`.
+Live synchronization must tolerate active outputs changing without claiming a
+consistent final copy; `final=True` must retain strict download validation.
+It must use saved pull exclusions, never delete local/remote files, and preserve
+saved source/input files, `.encap.conf`, `.encap_history.conf` and `.encap-run`.
+New run records include `preparation.source_files` for this purpose. Registering
+legacy runs recovers that list from the original source directory; keep that
+directory available until the first registration. Other output files can be
+refreshed from the cloud as with an explicit pull. File locks prevent competing
+downloads and avoid syncing while a submission/rerun is being prepared.
+Daemon monitoring does not replace saved execution handles.
+
+Only files already uploaded by the worker can be downloaded. Dataproc uploads
+log snapshots periodically but normally uploads other outputs at finalization.
+Automatic log downloads use temporary files and atomic replacement, retrying
+generation changes without removing a previous local snapshot. Unchanged log
+generations are not downloaded again.
+Live snapshots and deliberate exclusions remain recorded in `retrieval.json`;
+they are not full-run integrity verification. Explicit `pull` retains its existing
+behavior, including downloading source/configuration files.
+
+### Optional interactive SSH
+
+Set `Registration.supports_ssh=True` and implement
+`ssh(handle, instance=None, tunnel_through_iap=False)`. The default is unsupported;
+existing plugins and saved handle formats are unchanged. Core reconnects with
+empty configuration and passes the saved handle plus the SSH-only CLI options.
+The backend must resolve the actual machine, reject ambiguous/unknown instance
+IDs, and inherit the terminal's standard streams for interactive programs.
+Connection failures must raise `BackendError`; interrupts must not cancel work.
+Google-specific SSH routing stays in the Dataproc plugin.
+
+### Optional cloud discovery
+
+Set `Registration.list_runs` to a callable accepting the selected `PluginConfig`
+and returning `list[RunStatus]`. This additive API 3 capability does not change
+saved handles or require existing plugins to implement discovery. Keep the
+registration callback lightweight and import provider implementation lazily,
+as with `factory`.
+
+The callback must discover active jobs directly from its provider, paginate
+through all results and raise `BackendError` (usually `MonitoringError`) on
+authentication, permission, connection or incomplete-listing errors. It receives
+current configuration, not a saved handle, and should validate only the settings
+needed for listing. Include provider job IDs, raw state, placement and useful
+links in each status's `details`. Do not infer output finalization from job
+discovery; leave those fields unknown unless verified.
+Optional `details.source` and `details.name` strings select the table's Experiment
+and Name columns instead of the provider Job ID column. With
+`details.multiple_instances=True`, the name includes the `details.instance` suffix.
 
 ## Implement the contract
 
@@ -214,9 +378,11 @@ Import shared types and errors from `encap_lib.backends`:
 | Method | Responsibility |
 |---|---|
 | `submit(request, writer) -> RunHandle` | Package the prepared run folder, submit work and return its reference. |
+| `rerun(request, handle, writer) -> RunHandle` | Optional: run selected instances from the saved experiment, preserving unselected handles. |
 | `status(handle) -> RunStatus` | Report computation state, exit code and output/cleanup details. |
 | `tail(handle)` | Stream available logs; Ctrl-C only detaches. |
 | `pull(handle, destination)` | Download outputs without deleting unrelated files or overwriting `.encap-run`. |
+| `sync(handle, destination, final=False)` | Optional: background output snapshots using saved exclusions and preserving local source/configuration. |
 | `cancel(handle)` | Explicitly request cancellation. |
 
 `RunRequest.run_folder` is an **already-created local experiment directory**.
@@ -251,6 +417,11 @@ metadata must reject its absence explicitly; other plugins can ignore it.
 POSIX-relative to that origin. This metadata lets a plugin distinguish dependency
 files from prepared experiment files, including overlaps and single-file targets,
 when relocating the experiment. Its default is an empty tuple for older callers.
+`RunRequest.source_path` optionally records the original source file or directory
+as an absolute path for display metadata. It is not another tree to package:
+plugins must still execute the prepared snapshot. Dataproc stores its path
+relative to the configured workspace root (or submission working directory) in
+the cloud request so discovery can display the source and full run name.
 Keep a durable handle for every potentially accepted submission and never
 automatically submit missing instances after partial submission failure.
 Supplying any registered plugin CLI option also selects its backend.
@@ -275,6 +446,10 @@ state, not a `RunStatus` state.
 On reconnect the factory receives empty configuration. Use the saved handle,
 not current defaults. Reconcile uncertain submissions without automatically
 resubmitting; updates to `handle.data` are persisted by core.
+Errors include the saved run's `encap status` command when a recovery handle
+exists. Without a handle, check provider job/workflow history; only after
+confirming no submission was accepted should the local run folder be moved to
+an unused backup path, preserving its recovery metadata, before retrying.
 
 States are `submitted`, `running`, `succeeded`, `failed`, `cancelled` and `unknown`.
 Report success only after output saving succeeds. Core supplies five-second

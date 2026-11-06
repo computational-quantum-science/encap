@@ -4,6 +4,7 @@ import importlib.util
 import json
 import shlex
 import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from encap_lib import backends, encap_settings as settings, native_wait, plugin_cli
+from encap_lib import autopull, backends, encap_settings as settings, native_wait, plugin_cli
 from encap_lib.backends import (
     BackendError, CLIOption, ConfigurationError, MonitoringError, PluginConfig, RecordWriter,
     Registration, RunHandle, RunStatus,
@@ -37,6 +38,7 @@ def test_discovery_and_selector_collisions(monkeypatch):
         ([registration, registration], "Duplicate backend"),
         ([Registration("other", Mock(), ("-fake",)), registration], "duplicate plugin selector"),
         ([Registration("fake", Mock(), api_version=999)], "Install compatible"),
+        ([Registration("fake", Mock(), list_runs=True)], "Invalid run listing callback"),
         ([Registration("fake", Mock(), ("-fake",), cli_options=(
             CLIOption(("-fake",), "setting"),
         ))], "duplicate plugin selector"),
@@ -135,6 +137,9 @@ def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "args_config", {})
     monkeypatch.setattr(settings, "using_slurm", False)
     monkeypatch.setattr(settings, "using_pueue", False)
+    monkeypatch.setattr(autopull, "watch", Mock(return_value={
+        "enabled": True, "interval_seconds": 60, "pid": 123,
+    }))
     factory = Mock()
     backend = factory.return_value
     backend.submit.return_value = RunHandle({"operation": "123"})
@@ -153,6 +158,148 @@ def cli(tmp_path, monkeypatch):
 def invoke(cli, monkeypatch, *arguments):
     monkeypatch.setattr(sys, "argv", ["encap", *arguments])
     return cli.main()
+
+
+@pytest.mark.parametrize("selection", ["implicit", "selector", "configured"])
+@pytest.mark.parametrize("target", [True, False])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_cloud_status_without_name_uses_provider_not_local_records(
+    cli, tmp_path, monkeypatch, capsys, selection, target, json_output,
+):
+    module, factory, backend = cli
+    callback = Mock(return_value=[RunStatus("running", details={"job_id": "remote-only"})])
+    registration = replace(backends.discover()["fake"], list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    configuration = {
+        "dependencies": ["../missing-dependency"], "workspace_root": str(tmp_path),
+        "plugins": {"fake": {"project": "test-project", "region": "test-region"}},
+        "i": 4,
+    }
+    if selection == "configured":
+        configuration["backend"] = "fake"
+    directory = tmp_path / "experiment" if target else tmp_path
+    settings.write_config_file(directory / ".encap.conf", configuration)
+    arguments = ["status", *(["experiment"] if target else []), *(["-fake"] if selection == "selector" else [])]
+    if json_output:
+        arguments.append("--json")
+    invoke(module, monkeypatch, *arguments)
+    callback.assert_called_once()
+    assert callback.call_args.args[0] == {"project": "test-project", "region": "test-region"}
+    assert isinstance(callback.call_args.args[0], PluginConfig)
+    output = capsys.readouterr().out
+    if json_output:
+        assert json.loads(output) == {
+            "backend": "fake", "runs": [asdict(RunStatus("running", details={"job_id": "remote-only"}))],
+        }
+    else:
+        assert "Backend: fake" in output
+        assert "Project: test-project" in output
+        assert "Region: test-region" in output
+        assert "| Job ID" in output
+        assert "remote-only" in output
+        assert "Running" in output
+        assert '"runs"' not in output
+    factory.assert_not_called()
+    backend.submit.assert_not_called()
+    assert not (tmp_path / "0encap_folder").exists()
+
+
+@pytest.mark.parametrize("result", [[], "invalid", [object()]])
+def test_cloud_status_validates_listing(cli, monkeypatch, capsys, result):
+    module, factory, _ = cli
+    callback = Mock(return_value=result)
+    registration = replace(backends.discover()["fake"], list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    if result == []:
+        invoke(module, monkeypatch, "status", "-fake")
+        assert capsys.readouterr().out == "Backend: fake\nNo active jobs.\n"
+        invoke(module, monkeypatch, "status", "-fake", "--json")
+        assert json.loads(capsys.readouterr().out) == {"backend": "fake", "runs": []}
+    else:
+        with pytest.raises(SystemExit) as error:
+            invoke(module, monkeypatch, "status", "-fake")
+        assert error.value.code == 2
+        assert "invalid run listing" in capsys.readouterr().err
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("arguments,message", [
+    (["run", "experiment", "-n", "trial", "--json"], "--json requires status"),
+    (["status", "--json"], "--json requires a plugin backend"),
+])
+def test_json_status_rejects_unsupported_commands(cli, monkeypatch, capsys, arguments, message):
+    module, factory, _ = cli
+    with pytest.raises(SystemExit) as error:
+        invoke(module, monkeypatch, *arguments)
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+    factory.assert_not_called()
+
+
+def test_cloud_status_reports_provider_failure(cli, monkeypatch, capsys):
+    module, _, _ = cli
+    callback = Mock(side_effect=MonitoringError("permission denied"))
+    registration = replace(backends.discover()["fake"], list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    with pytest.raises(SystemExit) as error:
+        invoke(module, monkeypatch, "status", "-fake")
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert "permission denied" in captured.err
+    assert not captured.out
+
+
+def test_cloud_status_requires_supported_unambiguous_backend(cli, tmp_path, monkeypatch, capsys):
+    module, _, _ = cli
+    original = backends.discover()["fake"]
+    with pytest.raises(SystemExit) as error:
+        invoke(module, monkeypatch, "status", "-fake")
+    assert error.value.code == 2
+    assert "specify a saved run with -n" in capsys.readouterr().err
+    callback = Mock(return_value=[])
+    first = replace(original, list_runs=callback)
+    second = Registration("other", Mock(), list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": first, "other": second})
+    (tmp_path / "experiment/.encap.conf").write_text("plugins:\n  fake: {}\n  other: {}\n")
+    with pytest.raises(SystemExit) as error:
+        invoke(module, monkeypatch, "status", "experiment")
+    assert error.value.code == 2
+    assert "Multiple listing backends" in capsys.readouterr().err
+    callback.assert_not_called()
+    invoke(module, monkeypatch, "status", "experiment", "--backend", "other")
+    callback.assert_called_once()
+
+
+def test_native_status_does_not_infer_cloud_backend(cli, tmp_path, monkeypatch):
+    module, _, _ = cli
+    callback = Mock(return_value=[])
+    registration = replace(backends.discover()["fake"], list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    (tmp_path / "experiment/.encap.conf").write_text("plugins:\n  fake: {}\n")
+    machine = Mock()
+    monkeypatch.setattr(module, "LocalMachine", Mock(return_value=machine))
+    monkeypatch.setattr(module, "get_machine", Mock(return_value=machine))
+    monkeypatch.setattr(module, "get_status", Mock(return_value={}))
+    monkeypatch.setattr(module, "print_status", Mock())
+    monkeypatch.setattr(module.slurm, "print_slurm_status_if_using_slurm", Mock())
+    with pytest.raises(SystemExit):
+        invoke(module, monkeypatch, "status", "experiment", "-vm", "host")
+    callback.assert_not_called()
+    module.get_status.assert_called_once_with(machine)
+
+
+def test_named_status_keeps_using_saved_handle_with_discovery_available(cli, monkeypatch, capsys):
+    module, _, backend = cli
+    callback = Mock(side_effect=AssertionError("named status must not use discovery"))
+    registration = replace(backends.discover()["fake"], list_runs=callback)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    capsys.readouterr()
+    backend.status.return_value = RunStatus("running")
+    invoke(module, monkeypatch, "status", "experiment", "-n", "trial")
+    backend.status.assert_called_once_with(RunHandle({"operation": "123"}))
+    callback.assert_not_called()
+    assert json.loads(capsys.readouterr().out)["state"] == "running"
 
 
 @pytest.mark.parametrize("arguments,expected", [
@@ -207,7 +354,7 @@ def test_invalid_shared_pull_exclusions_fail_before_preparing_run(cli, monkeypat
     assert not Path("0encap_folder").exists()
 
 
-@pytest.mark.parametrize("mode", ["wait", "status", "kill", "copy", "rerun", "tar", "untar"])
+@pytest.mark.parametrize("mode", ["wait", "status", "kill", "copy", "tar", "untar"])
 def test_pull_exclusion_cli_rejects_unrelated_modes(cli, monkeypatch, mode):
     module, factory, backend = cli
     with pytest.raises(SystemExit) as result:
@@ -300,6 +447,77 @@ def test_status_reports_retrieval_separately_from_remote_success(cli, tmp_path, 
     assert status["retrieval"]["sources"]["gs://bucket/output/"]["scope"] == "partial"
 
 
+@pytest.mark.parametrize("extra,instance,iap", [
+    ([], None, False),
+    (["--instance", "2", "--tunnel-through-iap"], 2, True),
+])
+def test_ssh_uses_saved_plugin_without_loading_current_config(cli, tmp_path, monkeypatch, extra, instance, iap):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_ssh=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    destination = tmp_path / "0encap_folder" / "experiment" / "trial"
+    writer = RecordWriter.reserve(destination, registration, "trial")
+    handle = RunHandle({"operation": "saved"})
+    writer.save_handle(handle)
+    (tmp_path / "experiment" / ".encap.conf").write_text("not: [valid")
+    invoke(module, monkeypatch, "ssh", "experiment", "-n", "trial", *extra)
+    factory.assert_called_once_with({})
+    backend.ssh.assert_called_once_with(handle, instance=instance, tunnel_through_iap=iap)
+    backend.submit.assert_not_called()
+    backend.tail.assert_not_called()
+    backend.pull.assert_not_called()
+    backend.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_ssh_rejects_missing_record_or_unsupported_backend(cli, tmp_path, monkeypatch, capsys, saved):
+    module, factory, backend = cli
+    if saved:
+        writer = RecordWriter.reserve(
+            tmp_path / "0encap_folder" / "experiment" / "trial",
+            backends.discover()["fake"], "trial",
+        )
+        writer.save_handle(RunHandle({"operation": "saved"}))
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "ssh", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    assert ("does not support ssh" if saved else "no .encap-run record") in capsys.readouterr().err
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("arguments,message", [
+    (["ssh"], "requires a target"),
+    (["ssh", "experiment"], "requires a target"),
+    (["ssh", "experiment", "-n", "trial", "--instance", "-1"], "nonnegative"),
+    (["status", "--instance", "0"], "require ssh"),
+    (["status", "--tunnel-through-iap"], "require ssh"),
+])
+def test_ssh_argument_validation(cli, monkeypatch, capsys, arguments, message):
+    module, factory, backend = cli
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, *arguments)
+    assert result.value.code == 2
+    assert message in capsys.readouterr().err
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("error,code", [(KeyboardInterrupt(), 130), (BackendError("SSH failed"), 2)])
+def test_ssh_failure_or_detachment_never_cancels(cli, tmp_path, monkeypatch, error, code):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_ssh=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    writer = RecordWriter.reserve(
+        tmp_path / "0encap_folder" / "experiment" / "trial", registration, "trial",
+    )
+    writer.save_handle(RunHandle({"operation": "saved"}))
+    backend.ssh.side_effect = error
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "ssh", "experiment", "-n", "trial")
+    assert result.value.code == code
+    backend.cancel.assert_not_called()
+    backend.pull.assert_not_called()
+
+
 def test_plugin_lifecycle_uses_saved_handle(cli, tmp_path, monkeypatch, capsys):
     module, factory, backend = cli
     (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    bucket: original\n")
@@ -308,6 +526,7 @@ def test_plugin_lifecycle_uses_saved_handle(cli, tmp_path, monkeypatch, capsys):
     request = backend.submit.call_args.args[0]
     assert request.arguments == ["--value", "two words"]
     assert request.entrypoint == "run.py"
+    assert request.source_path == tmp_path / "experiment"
     assert request.run_folder == tmp_path / "0encap_folder" / "experiment" / "trial"
     assert (request.run_folder / "run.py").read_text() == "print('hello')"
     assert (request.run_folder / ".encap.conf").is_file()
@@ -404,6 +623,232 @@ def test_plugin_options_require_new_run(cli, monkeypatch):
     backend.submit.assert_not_called()
 
 
+def test_cloud_submission_and_rerun_register_automatic_pulls(cli, monkeypatch):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_autopull=True, supports_rerun=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    request = backend.submit.call_args.args[0]
+    autopull.watch.assert_called_once_with(request.run_folder, registration, automatic=True)
+    record = RecordWriter(request.record_dir).read()
+    assert "run.py" in record["preparation"]["source_files"]
+    backend.rerun.return_value = RunHandle({"operation": "rerun"})
+    invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial")
+    assert autopull.watch.call_count == 2
+    assert RecordWriter(request.record_dir).read()["preparation"]["source_files"] == record["preparation"]["source_files"]
+
+
+def test_partial_submission_is_watched_without_resubmission(cli, monkeypatch):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_autopull=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    def partial(request, writer):
+        writer.save_handle(RunHandle({"operation": "uncertain"}))
+        raise MonitoringError("partial submission")
+    backend.submit.side_effect = partial
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    autopull.watch.assert_called_once()
+    backend.submit.assert_called_once()
+    backend.cancel.assert_not_called()
+
+
+def test_daemon_start_failure_is_reported_without_losing_submission(cli, monkeypatch, capsys):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_autopull=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    autopull.watch.side_effect = BackendError("daemon unavailable")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    record = RecordWriter(backend.submit.call_args.args[0].record_dir).read()
+    assert record["state"] == "submitted"
+    assert record["autopull_error"] == "daemon unavailable"
+    assert "submission is saved" in capsys.readouterr().err
+    backend.tail.assert_called_once()
+    backend.cancel.assert_not_called()
+
+
+def test_watch_registers_existing_run_without_loading_source_configuration(cli, monkeypatch, tmp_path):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_autopull=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    (tmp_path / "experiment" / ".encap.conf").write_text("broken: [config")
+    backend.reset_mock()
+    invoke(module, monkeypatch, "watch", "experiment", "-n", "trial")
+    assert autopull.watch.call_args.kwargs == {"source_dir": tmp_path / "experiment"}
+    backend.submit.assert_not_called()
+    backend.tail.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "status"])
+def test_daemon_cli_does_not_need_target_name_or_machine(cli, monkeypatch, capsys, action):
+    module, _, _ = cli
+    command = Mock(return_value={
+        "running": action != "stop", "pid": 123, "enabled": True,
+        "interval_seconds": 60, "runs": {},
+    })
+    monkeypatch.setattr(autopull, action, command)
+    invoke(module, monkeypatch, "daemon", action)
+    command.assert_called_once_with()
+    output = capsys.readouterr().out
+    if action == "status":
+        assert "Daemon: running (PID 123)" in output
+        assert "Interval: 60s" in output
+        assert "No watched runs." in output
+    else:
+        assert json.loads(output)["interval_seconds"] == 60
+
+
+def test_daemon_cli_json_preserves_full_status(cli, monkeypatch, capsys):
+    module, _, _ = cli
+    info = {
+        "running": True, "pid": 123, "enabled": True, "interval_seconds": 60,
+        "runs": {"/saved/experiment/trial": {"revision": 3, "error": None}},
+        "log": "/daemon/daemon.log",
+    }
+    command = Mock(return_value=info)
+    monkeypatch.setattr(autopull, "status", command)
+    invoke(module, monkeypatch, "daemon", "status", "--json")
+    command.assert_called_once_with()
+    assert json.loads(capsys.readouterr().out) == info
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_daemon_json_requires_status(cli, monkeypatch, capsys, action):
+    module, _, _ = cli
+    command = Mock()
+    monkeypatch.setattr(autopull, action, command)
+    with pytest.raises(SystemExit) as exc:
+        invoke(module, monkeypatch, "daemon", action, "--json")
+    assert exc.value.code == 2
+    assert "--json requires daemon status" in capsys.readouterr().err
+    command.assert_not_called()
+
+
+@pytest.mark.parametrize("file_mode", [False, True])
+def test_plugin_rerun_uses_saved_files_and_keeps_record(cli, tmp_path, monkeypatch, file_mode):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_rerun=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    target = "experiment/run.py" if file_mode else "experiment"
+    invoke(module, monkeypatch, "run", target, "-n", "trial", "-fake_number", "1")
+    request = backend.submit.call_args.args[0]
+    saved = request.run_folder
+    writer = RecordWriter(request.record_dir)
+    old_handle = writer.read()["handle"]
+    (saved / "run.py").write_text("print('saved edit')")
+    (saved / "results_0.txt").write_text("keep instance zero")
+    (tmp_path / "experiment" / "run.py").write_text("print('do not copy')")
+    backend.rerun.return_value = RunHandle({"operation": "rerun"})
+    backend.reset_mock()
+    invoke(module, monkeypatch, "rerun", target, "-n", "trial", "-sn", "run.py", "-fake_number", "3")
+    rerun_request, handle, rerun_writer = backend.rerun.call_args.args
+    assert rerun_request.run_folder == saved
+    assert rerun_request.workspace_origin == request.workspace_origin
+    assert asdict(handle) == old_handle
+    assert rerun_writer.path == writer.path
+    assert (saved / "run.py").read_text() == "print('saved edit')"
+    assert (saved / "results_0.txt").read_text() == "keep instance zero"
+    assert factory.call_args.args[0]["number"] == 3
+    assert writer.read()["handle"]["data"] == {"operation": "rerun"}
+    assert yaml.safe_load((saved / ".encap_history.conf").read_text())["plugins"]["fake"]["number"] == 3
+    backend.submit.assert_not_called()
+    backend.tail.assert_called_once_with(backend.rerun.return_value)
+    backend.pull.assert_called_once_with(backend.rerun.return_value, saved)
+
+
+def test_plugin_rerun_preserves_saved_configuration(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_rerun=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    (tmp_path / "experiment" / ".encap.conf").write_text("plugins:\n  fake:\n    setting: original\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    (tmp_path / "experiment" / ".encap.conf").write_text("broken: [configuration")
+    backend.rerun.return_value = RunHandle({"operation": "rerun"})
+    invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial")
+    assert factory.call_args.args[0]["setting"] == "original"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_plugin_rerun_rebuilds_dependencies_without_copying_source(cli, tmp_path, monkeypatch, legacy):
+    import shutil
+
+    module, factory, backend = cli
+    registration = replace(backends.discover()["fake"], supports_rerun=True, supports_dependencies=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "data.txt").write_text("dependency")
+    (tmp_path / "experiment" / ".encap.conf").write_text(
+        "dependencies: [../src]\nrsync_exclude_push: ['*.large']\n"
+    )
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    request = backend.submit.call_args.args[0]
+    shutil.rmtree(request.workspace_folder)
+    writer = RecordWriter(request.record_dir)
+    if legacy:
+        record = writer.read()
+        record.pop("preparation")
+        writer._write(record)
+    (request.run_folder / "run.py").write_text("print('saved')")
+    (request.run_folder / "skip.large").write_text("do not upload")
+    backend.rerun.return_value = RunHandle({"operation": "rerun"})
+    invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial", "--rsync-exclude-pull", "*.pkl")
+    prepared = backend.rerun.call_args.args[0]
+    assert prepared.workspace_origin == tmp_path.resolve()
+    assert (prepared.workspace_folder / "src" / "data.txt").read_text() == "dependency"
+    assert (prepared.workspace_folder / prepared.experiment_path / "run.py").read_text() == "print('saved')"
+    assert not (prepared.workspace_folder / prepared.experiment_path / "skip.large").exists()
+    assert factory.call_args.args[0].rsync_exclude_pull == ["*.pkl"]
+
+
+def test_plugin_rerun_requires_opt_in_and_matching_backend(cli, monkeypatch, capsys):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial")
+    assert result.value.code == 2
+    assert "does not support rerun" in capsys.readouterr().err
+    registration = replace(backends.discover()["fake"], supports_rerun=True)
+    monkeypatch.setattr(backends, "discover", lambda: {"fake": registration})
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "rerun", "experiment", "-n", "trial", "--backend", "other")
+    assert result.value.code == 2
+    backend.rerun.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["status", "wait", "tail", "pull", "kill"])
+def test_monitoring_does_not_replace_handles_from_a_concurrent_rerun(cli, monkeypatch, mode):
+    module, factory, backend = cli
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    request = backend.submit.call_args.args[0]
+    writer = RecordWriter(request.record_dir)
+    newer = RunHandle({"instances": ["previous", "newly-submitted"]})
+    def update_record(*args):
+        writer.save_handle(newer, confirmed=True)
+        return RunStatus("succeeded", 0)
+    method = {"status": "status", "wait": "status", "tail": "tail", "pull": "pull", "kill": "cancel"}[mode]
+    getattr(backend, method).side_effect = update_record
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, mode, "experiment", "-n", "trial")
+    assert result.value.code == 2
+    assert writer.read()["handle"] == asdict(newer)
+
+
+def test_run_log_follower_does_not_drop_later_rerun_handles(cli, monkeypatch):
+    module, factory, backend = cli
+    newer = RunHandle({"instances": ["previous", "newly-submitted"]})
+    def concurrent_rerun(handle):
+        request = backend.submit.call_args.args[0]
+        RecordWriter(request.record_dir).save_handle(newer, confirmed=True)
+    backend.tail.side_effect = concurrent_rerun
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    assert result.value.code == 2
+    writer = RecordWriter(backend.submit.call_args.args[0].record_dir)
+    assert writer.read()["handle"] == asdict(newer)
+
+
 def test_removed_core_option_requires_explicit_migration(cli, monkeypatch, tmp_path):
     module, factory, backend = cli
     (tmp_path / "experiment" / ".encap.conf").write_text("backend: fake\nbackend_instances: 2\n")
@@ -469,7 +914,59 @@ def test_not_submitted_run_has_no_remote_management(cli, tmp_path, monkeypatch, 
     with pytest.raises(SystemExit) as result:
         invoke(module, monkeypatch, mode, "experiment", "-n", "trial")
     assert result.value.code == 2
-    assert "not submitted" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "not submitted" in message
+    assert "Rerun your original encap run command with the same options" in message
+    assert "Answer y" in message
+    assert "different run name with -n" in message
+    backend.submit.assert_not_called()
+    backend.status.assert_not_called()
+    backend.tail.assert_not_called()
+    backend.pull.assert_not_called()
+    backend.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("target", ["experiment", "experiment with spaces"])
+def test_unconfirmed_submission_includes_status_command(cli, tmp_path, monkeypatch, capsys, target):
+    module, _, backend = cli
+    if target != "experiment":
+        (tmp_path / "experiment").rename(tmp_path / target)
+    invoke(module, monkeypatch, "run", target, "-n", "trial", "-fake")
+    writer = RecordWriter(tmp_path / "0encap_folder" / target / "trial" / ".encap-run")
+    writer.update(state="submission-unconfirmed")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, "run", target, "-n", "trial")
+    assert result.value.code == 2
+    message = capsys.readouterr().err
+    assert shlex.join(["encap", "status", target, "-n", "trial"]) in message
+    assert "Keep the .encap-run recovery metadata" in message
+    assert "Do not resubmit while cloud acceptance is uncertain" in message
+    backend.status.assert_not_called()
+    backend.submit.assert_called_once()
+    backend.status.return_value = RunStatus("running")
+    invoke(module, monkeypatch, "status", target, "-n", "trial")
+    backend.status.assert_called_once_with(RunHandle({"operation": "123"}))
+
+
+@pytest.mark.parametrize("mode", ["run", "status", "wait", "tail", "pull", "kill"])
+def test_missing_handle_includes_safe_recovery_steps(cli, tmp_path, monkeypatch, capsys, mode):
+    module, _, backend = cli
+    destination = tmp_path / "0encap_folder/experiment/trial"
+    writer = RecordWriter.reserve(destination, Registration("fake", Mock()), "trial")
+    before = writer.read()
+    with pytest.raises(SystemExit) as result:
+        invoke(module, monkeypatch, mode, "experiment", "-n", "trial")
+    assert result.value.code == 2
+    message = capsys.readouterr().err
+    assert "no recovery handle was saved" in message
+    assert "Check the cloud provider's job/workflow history" in message
+    assert "Only after confirming that no submission was accepted" in message
+    assert shlex.quote(str(destination)) in message
+    assert "unused backup path" in message
+    assert "preserving its .encap-run metadata" in message
+    assert "rerun your original encap run command" in message
+    assert writer.read() == before
     backend.submit.assert_not_called()
     backend.status.assert_not_called()
     backend.tail.assert_not_called()

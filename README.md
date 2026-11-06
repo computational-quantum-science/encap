@@ -19,6 +19,7 @@ Encap currently supports:
 - Running multiple experiments in parallel
 - Running experiments on a cluster with Slurm or Pueue
 - Running experiments remotely via SSH
+- Automatically pulling cloud outputs in the background every 60 seconds
 
 Note that Encap is currently only compatible with Linux/macOS.
 
@@ -105,10 +106,12 @@ encap -h
 | --- | --- |
 | `encap run` | Copy the source into a new experiment and run it. |
 | `encap rerun` | Re-run an existing experiment without copying the source again. |
+| `encap watch` | Add an existing cloud run to automatic background pulls. |
 | `encap wait` | Wait for an experiment to finish without streaming logs or downloading outputs. |
 | `encap tail` | Follow an experiment's log. |
+| `encap ssh` | Open an interactive terminal for a saved run on a supporting plugin (Dataproc). Use `encap ssh ./experiment -n trial`, optionally with `--instance ID` and `--tunnel-through-iap`. |
 | `encap copy` | Copy the experiment named with `-cn` into the experiment named with `-n`. |
-| `encap status` | List running experiments for the current user, locally or with `-vm <machine_name>` on a remote machine. For plugin runs, specify the target and `-n` to show the saved run's status. |
+| `encap status` | List running experiments for the current user, locally or with `-vm <machine_name>` on a remote machine. With a listing-capable plugin, omit `-n` for a compact table of active cloud jobs (for example `encap status ./experiment -gcp`); add `--json` for full details. Specify the target and `-n` for one saved plugin run. |
 | `encap kill` | Stop a running experiment. |
 | `encap pull` | Download an experiment's files from the remote machine or execution backend. |
 | `encap push` | Upload an experiment's files to the remote machine. |
@@ -126,6 +129,33 @@ encap rerun scripts/my_script.py -n test
 ```
 
 This command re-runs the experiment without copying the script again. This is useful if you want to re-run an old experiment with different parameters. For instance, you can copy the script (using the copy command), modify the parameters, and then rerun the updated script.
+
+Dataproc supports the same saved-experiment workflow. For example, after running
+instance 0, add instances 1-3 without replacing the named experiment:
+
+```bash
+encap rerun ./experiment -n trial -gcp_i '[1, 2, 3]'
+```
+
+Unselected instances and results are retained. Selected completed instances are
+restarted; active or uncertain selected submissions are rejected. See the
+[plugin rerun contract](PLUGIN_README.md#rerunning-saved-experiments).
+
+Dataproc runs automatically register with a local background daemon that pulls
+available outputs every 60 seconds, respecting saved pull exclusions and
+preserving saved source/configuration files. It survives terminal detachment;
+downloads pause while your Mac sleeps. Add an older run or control the daemon:
+
+```bash
+encap watch ./experiment -n trial
+encap daemon status
+encap daemon status --json  # full diagnostic metadata
+encap daemon stop
+encap daemon start
+```
+
+Stopping pauses automatic pulls until you explicitly start them again. Cloud
+jobs keep running. See [automatic cloud pulls](PLUGIN_README.md#automatic-cloud-pulls).
 
 ## Following an Experiment with `encap tail`
 

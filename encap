@@ -7,6 +7,7 @@ import platform
 import sys
 import shlex
 import copy
+import json
 
 # name generation
 import datetime
@@ -18,9 +19,9 @@ from encap_lib.encap_lib import get_machine, filename_and_file_extension, get_in
 from encap_lib.encap_lib import record_process, remove_process_from_database
 from encap_lib import slurm
 import encap_lib.pueue
-from encap_lib.status import get_status, print_status
+from encap_lib.status import get_status, print_status, print_daemon_status
 import encap_lib.git_tracker as git_tracker
-from encap_lib import backends, plugin_cli, native_wait
+from encap_lib import autopull, backends, plugin_cli, native_wait
 from encap_lib.run_preparation import write_run_configuration
 
 def tail_pull(machine, run_folder_name, pid=None, log_file_name="log"):
@@ -504,14 +505,30 @@ def parse_arguments():
     from argparse import ArgumentParser
     import textwrap
 
+    if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+        daemon_parser = ArgumentParser(prog="encap daemon")
+        daemon_parser.add_argument("action", choices=("start", "stop", "status"))
+        daemon_parser.add_argument("--json", dest="status_json", action="store_true",
+                                   help="Print full daemon status as JSON instead of a table.")
+        pargs = daemon_parser.parse_args(sys.argv[2:])
+        if pargs.status_json and pargs.action != "status":
+            daemon_parser.error("--json requires daemon status")
+        pargs.mode = "daemon"
+        return pargs
+
     parser = ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("mode", help=textwrap.dedent("""The mode of the program. Either run, rerun, wait, tail, pull, copy, status, kill, tar or untar.
 run: Copies the target file into the experiment and runs it.
 rerun: Reruns the target file in the experiment without copying.
 wait: Waits for computation without streaming logs or pulling output.
 tail: Tails the log file of the experiment.
+ssh: Opens an interactive SSH session for a saved run on a supporting plugin.
+watch: Registers a saved cloud run for automatic local pulls every 60 seconds.
+daemon: Controls automatic pulls: encap daemon start, stop or status.
 copy: Copies the experiment specifeid with -cn into the experiment specified with -n.
-status: Prints the status of all the experiments running on the machine.
+status: Lists active experiments on the machine, or active cloud jobs for a selected/configured plugin.
+        Cloud listings use a table; --json prints machine-readable details.
+        For one saved plugin run, specify the target and -n.
 kill: Kills the running experiment. Note that if the flag -i is specified, then only the instance/list of instances specified by -i is killed. Else all instances if -i is not specified.
 tar: Tars the experiment, if -n is not specified, all experiments are tarred.
 untar: Untars the experiment, if -n is not specified, all experiments are untarred.
@@ -520,6 +537,12 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
 
     parser.add_argument("target", nargs="?", help="Name of the target file to run.", default=None)
     parser.add_argument("-n", "--name", dest="name", help="Name of the experiment.", default=None)
+    parser.add_argument("--json", dest="status_json", action="store_true",
+                        help="Print plugin status listings as JSON instead of a table.")
+    parser.add_argument("--instance", type=int, default=None, metavar="ID",
+                        help="Select a saved plugin instance for ssh (required for multi-instance runs).")
+    parser.add_argument("--tunnel-through-iap", action="store_true",
+                        help="Use a Google Cloud IAP tunnel for ssh to a private Dataproc master.")
     parser.add_argument("-cn", "--copy-name", dest="copy_name", help="Name of the experiment to copy from.", required=False, default=None)
     parser.add_argument("-a", "--args", dest="args", help="Arguments for the interpreter, for example --args ' -k 5', forming `<interpreter> <file_name> <args>`.", default=None)
     parser.add_argument("-vm", "--vm_name", dest="vm", help="Name of the Virtual Machine (VM).", default=None)
@@ -532,7 +555,7 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     parser.add_argument("-tar_cpus", "--tar_cpus", dest="tar_cpus", help="Number of cpus to use when tarring several experiments. Default is 1.", default=1, type=int)
     parser.add_argument("--rsync-exclude-pull", dest="rsync_exclude_pull", nargs="*", action="extend",
                         default=None, metavar="PATTERN",
-                        help="Override pull exclusions for run, tail or pull; quote globs such as '*.pkl'. "
+                        help="Override pull exclusions for run, rerun, tail or pull; quote globs such as '*.pkl'. "
                              "Supply no patterns to pull all outputs; omit the flag to use configured/saved exclusions.")
 
     # Slurm arguments
@@ -568,8 +591,16 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
     backends.register_selectors(parser, registrations)
     pargs = parser.parse_args()
     pargs.registrations = registrations
-    if pargs.rsync_exclude_pull is not None and pargs.mode not in ("run", "tail", "pull"):
-        raise backends.ConfigurationError("--rsync-exclude-pull requires run, tail or pull")
+    if pargs.status_json and pargs.mode != "status":
+        raise backends.ConfigurationError("--json requires status")
+    if (pargs.instance is not None or pargs.tunnel_through_iap) and pargs.mode != "ssh":
+        raise backends.ConfigurationError("--instance and --tunnel-through-iap require ssh")
+    if pargs.instance is not None and pargs.instance < 0:
+        raise backends.ConfigurationError("--instance must be a nonnegative integer")
+    if pargs.mode == "ssh" and (pargs.target is None or pargs.name is None):
+        raise backends.ConfigurationError("ssh requires a target and -n/--name for a saved plugin run")
+    if pargs.rsync_exclude_pull is not None and pargs.mode not in ("run", "rerun", "tail", "pull"):
+        raise backends.ConfigurationError("--rsync-exclude-pull requires run, rerun, tail or pull")
 
     # Read the data in
     if pargs.debug:
@@ -594,6 +625,14 @@ untar: Untars the experiment, if -n is not specified, all experiments are untarr
 
 def _main():
     pargs = parse_arguments()
+    if pargs.mode == "daemon":
+        action = {"start": autopull.start, "stop": autopull.stop, "status": autopull.status}[pargs.action]
+        info = action()
+        if pargs.action == "status" and not pargs.status_json:
+            print_daemon_status(info)
+        else:
+            print(json.dumps(info, indent=2))
+        return
     if plugin_cli.dispatch(pargs, pargs.registrations, get_script_name):
         return
     local_project_dir = os.getcwd()

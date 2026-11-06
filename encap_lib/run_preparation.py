@@ -16,6 +16,20 @@ SOURCE_EXCLUDED = frozenset((
     ".gcp", ".encap-native", "__pycache__", ".pytest_cache", ".ruff_cache", ".DS_Store",
 ))
 
+def saved_source_files(source_dir, run_folder):
+    source_dir, run_folder = Path(source_dir), Path(run_folder)
+    if not source_dir.is_dir():
+        raise ConfigurationError(f"Original source is unavailable and no saved source manifest exists: {source_dir}")
+    saved = []
+    for folder, directories, files in os.walk(source_dir):
+        directories[:] = sorted(name for name in directories if name not in SOURCE_EXCLUDED)
+        for name in files:
+            path = Path(folder) / name
+            relative = path.relative_to(source_dir)
+            if name not in SOURCE_EXCLUDED and path.is_file() and (run_folder / relative).is_file():
+                saved.append(relative.as_posix())
+    return sorted(saved)
+
 
 def _excluded(path, relative, patterns):
     return any(part in (".encap-run", ".encap-native", "0encap_folder") for part in relative.parts) or any(
@@ -82,8 +96,8 @@ def stage_source(source, destination, excluded):
         shutil.copy2(source, destination)
 
 
-def stage_workspace(source_dir, run_folder, dependencies, excluded):
-    if not dependencies:
+def stage_workspace(source_dir, run_folder, dependencies, excluded, force=False):
+    if not dependencies and not force:
         return None, "."
     source_dir = Path(os.path.abspath(source_dir))
     root = Path(os.path.commonpath([source_dir, *[path.parent if path.is_file() else path for path in dependencies]]))
