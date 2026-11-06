@@ -13,12 +13,12 @@ from encap_lib.backends import ConfigurationError
 
 SOURCE_EXCLUDED = frozenset((
     ".git", ".env", ".venv", "venv", ".output", "runs", "0encap_folder", ".encap-run",
-    ".gcp", "__pycache__", ".pytest_cache", ".ruff_cache", ".DS_Store",
+    ".gcp", ".encap-native", "__pycache__", ".pytest_cache", ".ruff_cache", ".DS_Store",
 ))
 
 
 def _excluded(path, relative, patterns):
-    return any(part in (".encap-run", "0encap_folder") for part in relative.parts) or any(
+    return any(part in (".encap-run", ".encap-native", "0encap_folder") for part in relative.parts) or any(
         fnmatch.fnmatch(relative.as_posix(), pattern.rstrip("/"))
         or fnmatch.fnmatch(path.name, pattern.rstrip("/")) for pattern in patterns
     )

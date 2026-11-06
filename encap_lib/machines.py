@@ -1,5 +1,6 @@
 import subprocess
 import shlex
+import shutil
 import threading
 from multiprocessing.pool import ThreadPool
 import os
@@ -231,6 +232,7 @@ class SSHMachine(Machine):
 
     def rsync_push(self, name_local, name_target, directory=True, dry_run=False,
                    last_timestamp_prevails=True, delete=False, ignore_times=False,
+                   exclude=(),
                    *args, **kwargs):
         # Upload file to VM
 
@@ -264,8 +266,8 @@ class SSHMachine(Machine):
             # -fp/--force-push CLI flag.
             options = "--ignore-times " + options
 
-        for exclude in self.rsync_exclude_push:
-            options = f"--exclude '{exclude}' " + options
+        for pattern in [*self.rsync_exclude_push, *exclude]:
+            options = f"--exclude {shlex.quote(pattern)} " + options
 
         code = f"""rsync {options} -v -e "ssh {self.ssh_options}" {self.local_project_dir}/{name_local} {self.username}@{self.ip}:{self.remote_project_dir}/{folder}"""
         return run_code_local(code, *args, **kwargs)
@@ -323,7 +325,7 @@ class LocalMachine(Machine):
 
     def rsync_push(self, name_local, name_target, directory=True,
                    dry_run=False, last_timestamp_prevails=True,
-                   delete=False, ignore_times=False, *args, **kwargs):
+                   delete=False, ignore_times=False, exclude=(), *args, **kwargs):
         """Local equivalent of SSHMachine.rsync_push.
 
         For LocalMachine, source and target paths refer to the same
@@ -337,6 +339,14 @@ class LocalMachine(Machine):
         # folder itself" -- map that to LocalMachine.push's copy_full_dir=False.
         copy_full_dir = not name_local.endswith("/")
         name_local = name_local.rstrip("/")
+        if directory and exclude:
+            source = os.path.join(self.local_project_dir, name_local)
+            destination = os.path.join(self.local_project_dir, os.path.dirname(name_target))
+            if copy_full_dir:
+                destination = os.path.join(destination, os.path.basename(name_local))
+            if os.path.abspath(source) != os.path.abspath(destination):
+                shutil.copytree(source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns(*exclude))
+            return None
         # We don't rstrip name_target because push uses the trailing slash to determine if it should copy into the directory itself or its parent.
         return self.push(name_local, name_target, directory=directory,
                          copy_full_dir=copy_full_dir, *args, **kwargs)

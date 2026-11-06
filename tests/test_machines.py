@@ -71,3 +71,32 @@ def test_ssh_machine_rsync_push(mocker):
     assert "-e \"ssh -p 2222\"" in command
     assert "/local/dir/source_dir/" in command
     assert "user@192.168.1.1:/remote/dir/target_dir" in command
+
+
+def test_ssh_push_excludes_native_metadata_without_changing_pulls(mocker):
+    mock_run = mocker.patch("encap_lib.machines.run_code_local")
+    machine = SSHMachine(
+        ip="192.168.1.1", username="user", local_project_dir="/local/dir",
+        remote_project_dir="/remote/dir", rsync_exclude_push=["*.tmp"],
+    )
+    mocker.patch.object(machine, "run_code")
+    machine.rsync_push("source/", "target/", exclude=(".encap-native",), ignore_times=True)
+    assert "--exclude .encap-native" in mock_run.call_args.args[0]
+    assert "--exclude '*.tmp'" in mock_run.call_args.args[0]
+    assert "--ignore-times" in mock_run.call_args.args[0]
+    machine.pull("target", "target", directory=True)
+    assert "--exclude .encap-native" not in mock_run.call_args.args[0]
+
+
+def test_local_source_push_excludes_native_metadata(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "run.py").write_text("print('hello')")
+    (source / ".encap-native").mkdir()
+    (source / ".encap-native" / "tracking.json").write_text("stale")
+    machine = LocalMachine(local_project_dir=str(tmp_path))
+    machine.rsync_push("source/", "target/", exclude=(".encap-native",))
+    assert (tmp_path / "target" / "run.py").read_text() == "print('hello')"
+    assert not (tmp_path / "target" / ".encap-native").exists()
+    machine.rsync_push("source/", "source/", exclude=(".encap-native",))
+    assert (source / ".encap-native" / "tracking.json").read_text() == "stale"

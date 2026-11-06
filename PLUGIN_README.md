@@ -137,6 +137,15 @@ IDs as local OS PIDs or treats disappearance as success. Runs created before
 All recorded instances must complete. Built-in Slurm/Pueue wrappers now preserve
 the computation's exit code rather than masking it with the final log marker.
 
+New built-in runs keep internal metadata in one hidden `.encap-native/`
+directory: `tracking.json` records execution kind and per-instance process/job
+IDs, and `exit` / `exit_<index>` save OS-process exit codes atomically. `tail`
+reads the IDs from tracking, so new runs no longer create a separate `pid` file.
+Keep this directory with the experiment for later `wait` and `tail` commands.
+Existing top-level `.encap-native.json`, `.encap-exit*`, and legacy `pid` files
+remain readable; they are not automatically moved or deleted. When both tracking
+layouts exist, the new layout takes precedence, including its exit results.
+
 CLI exit codes: 0 for confirmed success, a valid remote nonzero code (1-255)
 when available, 1 for failure without a valid code, 130 for cancellation or
 client interrupt, and 2 for configuration/plugin/monitoring errors.

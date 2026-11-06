@@ -490,6 +490,7 @@ def test_missing_plugin_and_unsupported_mode(cli, tmp_path, monkeypatch):
     backend.submit.assert_not_called()
 
 
+@pytest.mark.parametrize("layout", ["native", "legacy"])
 @pytest.mark.parametrize("kind,state,expected", [
     ("slurm", "7|COMPLETED|0:0", 0), ("slurm", "7|FAILED|4:0", 4),
     ("slurm", "7|CANCELLED by 1|0:15", 130), ("slurm", "7|OUT_OF_MEMORY|0:9", 137),
@@ -498,11 +499,11 @@ def test_missing_plugin_and_unsupported_mode(cli, tmp_path, monkeypatch):
     ("pueue", {"Done": {"result": "Killed"}}, 130),
     ("process", "0", 0), ("process", "19", 19),
 ])
-def test_native_wait_actual_completion_mechanisms(kind, state, expected):
+def test_native_wait_actual_completion_mechanisms(kind, state, expected, layout):
     machine = Mock()
     tracking = json.dumps({"version": 1, "kind": kind, "identifiers": [{"id": "7", "instance": "0"}]})
     response = json.dumps({"tasks": {"7": {"status": state}}}) if kind == "pueue" else state
-    machine.run_code.side_effect = [([tracking], 0), ([response], 0)]
+    machine.run_code.side_effect = [([layout, tracking], 0), ([response], 0)]
     assert native_wait.wait(machine, "experiment") == expected
     if kind == "slurm":
         assert "sacct -j 7" in machine.run_code.call_args.args[0]
@@ -510,6 +511,8 @@ def test_native_wait_actual_completion_mechanisms(kind, state, expected):
         assert machine.run_code.call_args.args[0] == "pueue status --json"
     else:
         assert "kill -0 7" in machine.run_code.call_args.args[0]
+        expected_path = "experiment/.encap-exit" if layout == "legacy" else "experiment/.encap-native/exit"
+        assert expected_path in machine.run_code.call_args.args[0]
     assert all("tail" not in call.args[0] for call in machine.run_code.call_args_list)
 
 
@@ -517,11 +520,80 @@ def test_native_wait_actual_completion_mechanisms(kind, state, expected):
 def test_native_wait_disappearance_is_not_success(result):
     machine = Mock()
     machine.run_code.side_effect = [
-        ([json.dumps({"version": 1, "kind": "process", "identifiers": [{"id": "9", "instance": "0"}]})], 0),
+        (["native", json.dumps({"version": 1, "kind": "process", "identifiers": [{"id": "9", "instance": "0"}]})], 0),
         ([result], 0),
     ]
     with pytest.raises(MonitoringError):
         native_wait.wait(machine, "run")
+
+
+@pytest.mark.parametrize("kind,pid", [("process", "7"), ("slurm", "slurm:7"), ("pueue", None)])
+def test_native_tail_uses_tracking(kind, pid):
+    machine = Mock()
+    tracking = json.dumps({"version": 1, "kind": kind, "identifiers": [{"id": "7", "instance": "2"}]})
+    machine.run_code.return_value = (["native", tracking], 0)
+    assert native_wait.tail_target(machine, "run") == (pid, "log_2")
+    assert machine.run_code.call_count == 1
+
+
+def test_native_tracking_precedence_and_quoted_paths(tmp_path):
+    import subprocess
+    from encap_lib.machines import LocalMachine
+    folder = tmp_path / "run with 'quotes'"
+    folder.mkdir()
+    machine = LocalMachine(local_project_dir=str(tmp_path))
+    legacy = {"version": 1, "kind": "process", "identifiers": [{"id": "99", "instance": "0"}]}
+    (folder / ".encap-native.json").write_text(json.dumps(legacy))
+    (folder / ".encap-exit").write_text("0\n")
+    (folder / "pid").write_text("99\n")
+    native_wait.save_tracking(machine, folder.name, "process", [{"id": "7", "instance": "2"}])
+    result = subprocess.run(
+        ["bash", "-c", "false; " + native_wait.completion_code(2)], cwd=folder, capture_output=True,
+    )
+    assert result.returncode == 1
+    assert native_wait.wait(machine, folder.name) == 1
+    assert native_wait.tail_target(machine, folder.name) == ("7", "log_2")
+    assert (folder / ".encap-native" / "exit_2").read_text() == "1\n"
+    assert not list((folder / ".encap-native").glob("*.tmp"))
+    (folder / ".encap-native" / "tracking.json").write_text("invalid json")
+    with pytest.raises(MonitoringError, match="Invalid native run tracking"):
+        native_wait.wait(machine, folder.name)
+    (folder / ".encap-native" / "tracking.json").unlink()
+    assert native_wait.wait(machine, folder.name) == 0
+    assert native_wait.tail_target(machine, folder.name) == ("99", "log")
+
+
+@pytest.mark.parametrize("pid", ["7", "slurm:7", None])
+def test_native_tail_legacy_pid_without_tracking(tmp_path, pid):
+    from encap_lib.machines import LocalMachine
+    machine = LocalMachine(local_project_dir=str(tmp_path))
+    if pid is not None:
+        (tmp_path / "pid").write_text(pid + "\n")
+    assert native_wait.tail_target(machine, ".") == (pid, "log")
+    with pytest.raises(MonitoringError, match="No supported completion tracking"):
+        native_wait.wait(machine, ".")
+
+
+def test_native_tracking_read_errors_are_not_legacy_fallback(tmp_path):
+    from encap_lib.machines import LocalMachine
+    machine = LocalMachine(local_project_dir=str(tmp_path))
+    (tmp_path / ".encap-native").mkdir()
+    (tmp_path / ".encap-native" / "tracking.json").mkdir()
+    (tmp_path / "pid").write_text("7\n")
+    with pytest.raises(MonitoringError, match="Cannot monitor computation"):
+        native_wait.tail_target(machine, ".")
+    machine = Mock()
+    machine.run_code.return_value = (["ssh connection lost"], 255)
+    with pytest.raises(MonitoringError, match="connection lost"):
+        native_wait.read_tracking(machine, "run")
+
+
+def test_native_tracking_write_failure_is_explicit(tmp_path):
+    from encap_lib.machines import LocalMachine
+    (tmp_path / ".encap-native").write_text("not a directory")
+    with pytest.raises(MonitoringError, match="Cannot monitor computation"):
+        native_wait.save_tracking(LocalMachine(local_project_dir=str(tmp_path)), ".", "process",
+                                  [{"id": "7", "instance": "0"}])
 
 
 def test_project_global_namespace_precedes_experiment_config(cli, tmp_path, monkeypatch):
@@ -566,10 +638,10 @@ def test_cli_wait_interrupt_never_cancels(cli, monkeypatch):
 def test_native_wait_scheduler_missing_or_offline_is_error():
     tracking = json.dumps({"version": 1, "kind": "slurm", "identifiers": [{"id": "7", "instance": "0"}]})
     machine = Mock()
-    machine.run_code.side_effect = [([tracking], 0), ([], 0), ([], 0)]
+    machine.run_code.side_effect = [(["native", tracking], 0), ([], 0), ([], 0)]
     with pytest.raises(MonitoringError, match="absent"):
         native_wait.wait(machine, "run")
-    machine.run_code.side_effect = [([tracking], 0), (["ssh connection lost"], 255)]
+    machine.run_code.side_effect = [(["native", tracking], 0), (["ssh connection lost"], 255)]
     with pytest.raises(MonitoringError, match="connection lost"):
         native_wait.wait(machine, "run")
 
@@ -578,7 +650,7 @@ def test_native_pueue_wait_handles_modern_queued_status(monkeypatch):
     tracking = json.dumps({"version": 1, "kind": "pueue", "identifiers": [{"id": "7", "instance": "0"}]})
     machine = Mock()
     machine.run_code.side_effect = [
-        ([tracking], 0),
+        (["native", tracking], 0),
         ([json.dumps({"tasks": {"7": {"status": {"Queued": {"enqueued_at": "now"}}}}})], 0),
         ([json.dumps({"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}})], 0),
     ]

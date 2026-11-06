@@ -53,6 +53,24 @@ def test_pueue_run(mocker):
     # Check script content from write_file
     script_content = machine.write_file.call_args_list[0][0][1]
     assert "python -u  run.py" in script_content
+    tracking_command = next(call.args[0] for call in machine.run_code.call_args_list if "tracking.json" in call.args[0])
+    assert "/fake/run_folder/.encap-native/tracking.json" in tracking_command
+    assert not any("/pid" in call.args[0] for call in machine.run_code.call_args_list)
+
+
+def test_slurm_submission_saves_tracking_without_pid(tmp_path, mocker, monkeypatch):
+    from tests.test_encap_modes import load_encap
+    encap = load_encap(tmp_path)
+    machine = MagicMock()
+    machine.run_code.side_effect = lambda command, **kwargs: ([], 0) if kwargs.get("get_returncode") else ["Submitted batch job 42"]
+    log, jobid = encap.run_slurm(
+        machine, "py", "run.py", "", "/fake/run_folder", "run.py", "/fake/run_folder/run.py", {},
+    )
+    assert (log, jobid) == ("log", "42")
+    tracking_command = next(call.args[0] for call in machine.run_code.call_args_list if "tracking.json" in call.args[0])
+    assert "/fake/run_folder/.encap-native/tracking.json" in tracking_command
+    assert '"kind": "slurm"' in tracking_command
+    assert not any("/pid" in call.args[0] for call in machine.run_code.call_args_list)
 
 
 @pytest.mark.parametrize("scheduler", ["slurm", "pueue"])

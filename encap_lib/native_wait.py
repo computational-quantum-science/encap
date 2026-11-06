@@ -7,9 +7,16 @@ import time
 
 from encap_lib.backends import MonitoringError, POLL_INTERVAL
 
+DIRECTORY = ".encap-native"
+
+
+def exit_filename(index, legacy=False):
+    filename = "exit" if index == 0 else f"exit_{index}"
+    return ".encap-" + filename if legacy else DIRECTORY + "/" + filename
+
 
 def completion_code(index):
-    filename = ".encap-exit" if index == 0 else f".encap-exit_{index}"
+    filename = exit_filename(index)
     return (
         "encap_result=$?; "
         f"printf '%s\\n' \"$encap_result\" > {shlex.quote(filename + '.tmp')}; "
@@ -20,8 +27,10 @@ def completion_code(index):
 
 def save_tracking(machine, folder, kind, identifiers):
     data = json.dumps({"version": 1, "kind": kind, "identifiers": identifiers})
-    filename = shlex.quote(folder + "/.encap-native.json")
-    machine.run_code(f"printf '%s\\n' {shlex.quote(data)} > {filename}.tmp; mv {filename}.tmp {filename}")
+    directory = shlex.quote(folder + "/" + DIRECTORY)
+    filename = shlex.quote(folder + "/" + DIRECTORY + "/tracking.json")
+    _command(machine, f"mkdir -p {directory} && "
+             f"printf '%s\\n' {shlex.quote(data)} > {filename}.tmp && mv {filename}.tmp {filename}")
 
 
 def _command(machine, command):
@@ -31,8 +40,51 @@ def _command(machine, command):
     return lines
 
 
-def _read(machine, filename):
-    return _command(machine, f"cat {shlex.quote(filename)}")
+def read_tracking(machine, folder):
+    filename = shlex.quote(folder + "/" + DIRECTORY + "/tracking.json")
+    old_filename = shlex.quote(folder + "/.encap-native.json")
+    # Command output strips the last character of unterminated lines.
+    lines = _command(machine, f"if [ -e {filename} ] || [ -L {filename} ]; then "
+                     f"echo native; cat {filename} && printf '\\n'; "
+                     f"elif [ -e {old_filename} ] || [ -L {old_filename} ]; then "
+                     f"echo legacy; cat {old_filename} && printf '\\n'; else echo missing; fi")
+    if lines == ["missing"]:
+        return None, False
+    if not lines or lines[0] not in ("native", "legacy"):
+        raise MonitoringError("Invalid native run tracking response")
+    try:
+        tracking = json.loads("\n".join(lines[1:]))
+    except ValueError as error:
+        raise MonitoringError(f"Invalid native run tracking: {error}") from error
+    if (not isinstance(tracking, dict) or tracking.get("version") != 1
+            or tracking.get("kind") not in ("process", "slurm", "pueue")
+            or not isinstance(tracking.get("identifiers"), list) or not tracking["identifiers"]):
+        raise MonitoringError("No supported completion tracking. wait requires a run submitted by Encap 0.6 or later.")
+    if any(not isinstance(item, dict) or not re.fullmatch(r"[0-9]+", str(item.get("id", "")))
+           or not re.fullmatch(r"[0-9]+", str(item.get("instance", ""))) for item in tracking["identifiers"]):
+        raise MonitoringError("Invalid native computation identifiers")
+    return tracking, lines[0] == "legacy"
+
+
+def tail_target(machine, folder):
+    tracking, _ = read_tracking(machine, folder)
+    if tracking is not None:
+        first = tracking["identifiers"][0]
+        index = int(first["instance"])
+        log = "log" if index == 0 else f"log_{index}"
+        if tracking["kind"] == "process":
+            return str(first["id"]), log
+        if tracking["kind"] == "slurm":
+            return "slurm:" + str(first["id"]), log
+        return None, log
+    filename = shlex.quote(folder + "/pid")
+    lines = _command(machine, f"if [ -e {filename} ] || [ -L {filename} ]; then cat {filename} && printf '\\n'; fi")
+    if not lines:
+        return None, "log"
+    value = "\n".join(lines).strip()
+    if not re.fullmatch(r"(slurm:)?[0-9]+", value):
+        raise MonitoringError(f"Invalid legacy run PID: {value}")
+    return value, "log"
 
 
 def _pueue_result(task):
@@ -59,19 +111,11 @@ def _pueue_result(task):
 
 
 def wait(machine, folder, interval=POLL_INTERVAL):
-    try:
-        tracking = json.loads("\n".join(_read(machine, folder + "/.encap-native.json")))
-    except ValueError as error:
-        raise MonitoringError(f"Invalid native run tracking: {error}") from error
-    if (not isinstance(tracking, dict) or tracking.get("version") != 1
-            or tracking.get("kind") not in ("process", "slurm", "pueue")
-            or not isinstance(tracking.get("identifiers"), list) or not tracking["identifiers"]):
+    tracking, legacy = read_tracking(machine, folder)
+    if tracking is None:
         raise MonitoringError("No supported completion tracking. wait requires a run submitted by Encap 0.6 or later.")
     kind = tracking["kind"]
     identifiers = tracking["identifiers"]
-    if any(not isinstance(item, dict) or not re.fullmatch(r"[0-9]+", str(item.get("id", "")))
-           or not re.fullmatch(r"[0-9]+", str(item.get("instance", ""))) for item in identifiers):
-        raise MonitoringError("Invalid native computation identifiers")
     while True:
         results = []
         if kind == "slurm":
@@ -120,7 +164,7 @@ def wait(machine, folder, interval=POLL_INTERVAL):
         else:
             for item in identifiers:
                 index = int(item["instance"])
-                filename = ".encap-exit" if index == 0 else f".encap-exit_{index}"
+                filename = exit_filename(index, legacy)
                 path = shlex.quote(folder + "/" + filename)
                 # This command runs on the actual machine, not the client laptop.
                 lines = _command(machine, f"if [ -f {path} ]; then cat {path}; "

@@ -52,6 +52,18 @@ def test_workspace_preserves_layout_and_runs_offline(layout, tmp_path):
     assert not (workspace / "src" / "result.txt").exists()
 
 
+def test_native_metadata_is_not_packaged_as_source(layout, tmp_path):
+    metadata = layout / ".encap-native"
+    metadata.mkdir()
+    (metadata / "tracking.json").write_text("runtime state")
+    destination = tmp_path / "snapshot"
+    workspace, experiment_path = prepare(layout, destination)
+    assert not (destination / ".encap-native").exists()
+    assert not (workspace / experiment_path / ".encap-native").exists()
+    with pytest.raises(ConfigurationError, match="excluded"):
+        resolve_dependencies(settings.DependencyPaths([".encap-native"], str(layout)), layout, [])
+
+
 def test_dependency_origins_survive_inheritance_and_serialization(layout, tmp_path, monkeypatch):
     (tmp_path / ".encap.conf").write_text("dependencies: [src]\n")
     (layout / ".encap.conf").write_text("args: child\n")

@@ -36,7 +36,7 @@ def tail_pull(machine, run_folder_name, pid=None, log_file_name="log"):
         # Stream the log AND poll squeue. Exits on either the EOT marker
         # (normal completion) or when the slurm job leaves the queue (catches
         # scancel, walltime cap, OOM kill, etc.). `-n +1` so we dump the full
-        # log on attach, matching the --pid branch below.
+        # log on attach, matching local process attachment.
         jobid = pid.split(":", 1)[1]
         machine.run_code(f"""#!/bin/bash
 touch {run_folder_name}/{log_file_name}
@@ -61,10 +61,6 @@ while true; do
     fi
 done
 """, verbose=True, output=True)
-        machine.run_code(f"rm {run_folder_name}/pid -f")
-    elif is_os_pid and platform.system() != "Darwin":
-        machine.run_code(f"touch {run_folder_name}/{log_file_name}; tail -f -n +1 --pid={pid} -f {run_folder_name}/{log_file_name}", verbose=True, output=True)
-        machine.run_code(f"rm {run_folder_name}/pid -f")
     else:
         # Runs the tail command until it sees the special character.
         # `tail -f` is wired through an explicit FD so its PID is captured in
@@ -74,9 +70,11 @@ done
         # nothing after EOT (no atexit / no stderr flush), tail hangs forever,
         # ssh keeps the session up, and encap appears frozen until Ctrl-C.
         # `-n +1` so already-finished logs are dumped fully on attach.
+        # Persistent IDs may be reused after completion; EOT still stops the reader.
+        pid_option = f"--pid={pid} " if is_os_pid and platform.system() != "Darwin" else ""
         machine.run_code(f"""#!/bin/bash
 touch {run_folder_name}/{log_file_name}
-exec 3< <(exec tail -f -n +1 {run_folder_name}/{log_file_name})
+exec 3< <(exec tail {pid_option}-f -n +1 {run_folder_name}/{log_file_name})
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null' EXIT
 while IFS= read -r -u 3 LOGLINE || [[ -n "$LOGLINE" ]]; do
@@ -130,7 +128,7 @@ def generate_experiment_name():
 
 def run(machine, file_extension, target, args, run_folder_name, target_file, target_file_path, interprter_args="", number_of_instances=1, name=None):
     """
-    Run the file and save outputs in log, save PID in the file pid.
+    Run the file and save outputs in log and identifiers in native tracking.
     """
     # The right file is already on the remote by the time we get here:
     #   - folder-mode fresh-run: source pushed via rsync_push in mode_run_folder
@@ -190,8 +188,9 @@ def run(machine, file_extension, target, args, run_folder_name, target_file, tar
         code = f'''
         set -e # Exit on error
         
-        cd {run_folder_name}
-        rm -f .encap-exit{'' if i == 0 else '_' + str(i)}
+        cd {shlex.quote(run_folder_name)}
+        mkdir -p {shlex.quote(native_wait.DIRECTORY)}
+        rm -f {shlex.quote(native_wait.exit_filename(i))}
         export ENCAP_PROCID={i}
         export ENCAP_NAME="{run_folder_name}"
         export ENCAP_JOB_NAME="{job_name}"
@@ -208,9 +207,6 @@ def run(machine, file_extension, target, args, run_folder_name, target_file, tar
         '''
 
         if i == 0:
-            code += f"""
-        
-        echo "$PID" > pid"""
             pid = machine.run_code(code, output=True)[0]
             print('PID ' + pid)
         else:
@@ -227,8 +223,7 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
     # (Redundant self-push removed -- see comment in run() above.)
 
     # Delete previous log file and create a new one
-    machine.run_code(f"""rm {run_folder_name}/pid -f
-    rm {run_folder_name}/.slurm_files/log* -f
+    machine.run_code(f"""rm {run_folder_name}/.slurm_files/log* -f
     touch {run_folder_name}/log
     mkdir -p {run_folder_name}/.slurm_files
     """)
@@ -244,8 +239,7 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
         iterator = slurm_settings["i"]
     
     log_file_name = ""
-    # Capture the first instance's slurm job id and persist it as
-    # `slurm:<id>` in the pid file so `encap tail` can poll squeue and detect
+    # Capture the first instance's Slurm job ID in native tracking so tail can detect
     # both normal completion (EOT marker in log) and abnormal terminations
     # (scancel, walltime cap, OOM kill -- where no EOT is ever written).
     first_slurm_jobid = None
@@ -290,9 +284,7 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
             print("Error: Slurm does not seem to be installed on this machine.")
             exit(1)
 
-        # Extract the slurm job id from sbatch's output ("Submitted batch job
-        # 12345") and persist the first instance's id as "slurm:<id>" in the
-        # pid file. tail_pull uses this to poll squeue.
+        # Extract the Slurm job ID from sbatch's output ("Submitted batch job 12345").
         for line in out:
             parts = line.strip().split()
             if parts and parts[-1].isdigit():
@@ -302,8 +294,6 @@ def run_slurm(machine, file_extension, target, args, run_folder_name, target_fil
                 break
         else:
             raise backends.BackendError(f"Cannot determine submitted Slurm job ID: {out}")
-        if i == 0:
-            machine.run_code(f"echo 'slurm:{first_slurm_jobid}' > {run_folder_name}/pid")
 
     native_wait.save_tracking(machine, run_folder_name, "slurm", job_ids)
     return log_file_name, first_slurm_jobid
@@ -365,7 +355,7 @@ def mode_run_file(folder_name, run_folder_name, source_file_path, local_project_
     # Copy the local copy of pargs.target to the run_folder
     machine.push(source_file_path, target_file_path, directory=False, verbose=True)
 
-    # Run the file and save outputs in log, save PID in the file pid.
+    # Run the file and save outputs and native tracking.
     mode_rerun_file(run_folder_name=run_folder_name, local_project_dir=local_project_dir, machine=machine, pargs=pargs, rerun=False)
 
 def mode_run_folder(folder_name, run_folder_name, source_file_path, local_project_dir, machine, pargs, interpreter_args=""):
@@ -393,6 +383,7 @@ def mode_run_folder(folder_name, run_folder_name, source_file_path, local_projec
                        directory=True, verbose=True,
                        last_timestamp_prevails=not pargs.force_push,
                        ignore_times=pargs.force_push,
+                       exclude=(native_wait.DIRECTORY,),
                        ignore=["sending incremental", "sent ", "total size"])
 
     # Patch settings with all .encap.conf files. Walk from the *source* folder:
@@ -416,7 +407,7 @@ def mode_run_folder(folder_name, run_folder_name, source_file_path, local_projec
     settings.config["script_name"] = script_name
     settings.args_config["script_name"] = script_name
 
-    # Run the file and save outputs in log, save PID in the file pid.
+    # Run the file and save outputs and native tracking.
     mode_rerun_file(run_folder_name=run_folder_name,
                     local_project_dir=local_project_dir, machine=machine,
                     pargs=pargs, rerun=False)
@@ -470,6 +461,7 @@ def mode_rerun_file(run_folder_name, local_project_dir, machine, pargs, rerun=Tr
                            directory=True, verbose=True,
                            last_timestamp_prevails=not pargs.force_push,
                            ignore_times=pargs.force_push,
+                           exclude=(native_wait.DIRECTORY,),
                            ignore=["sending incremental", "sent ", "total size"])
 
     # Are we using slurm or pueue?
@@ -668,27 +660,15 @@ def _main():
         
         
     elif pargs.mode == "tail":
-        # ignore_errors=True so a missing pid file (slurm job that already
-        # finished, or a non-slurm experiment whose pid was cleaned up by a
-        # previous tail) doesn't raise inside run_code_local before we can
-        # decide what to do.
-        code = f"cat {run_folder_name}/pid"
-        out = machine.run_code(code, verbose=False, output=True, ignore_errors=True)
-
-        pid = None
-        if len(out) == 1:
-            content = out[0].strip()
-            if content.isdigit():
-                pid = content
+        pid, log_file_name = native_wait.tail_target(machine, run_folder_name)
+        if pid is not None:
+            if pid.startswith("slurm:"):
+                print("Slurm Job: ", pid.split(":", 1)[1])
+            else:
                 print("PID: ", pid)
-            elif content.startswith("slurm:"):
-                pid = content
-                print("Slurm Job: ", content.split(":", 1)[1])
-            # else: cat error message ("cat: ...: No such file or directory"),
-            # or some other unexpected content -- treat as no tracked process.
 
         machine.pull(run_folder_name, run_folder_name, directory=True)
-        tail_pull(machine, run_folder_name, pid)
+        tail_pull(machine, run_folder_name, pid, log_file_name=log_file_name)
         if pid is not None:
             remove_process_from_database(pargs.target, pargs.name)
 

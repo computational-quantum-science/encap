@@ -121,8 +121,7 @@ def run_pueue(machine, file_extension, target, args, run_folder_name, target_fil
     ensure_daemon_running(machine, auto_start=pueue_settings.get("auto_start", True))
     
     # Delete previous log file and create a new one
-    machine.run_code(f"""rm {run_folder_name}/pid -f
-    rm {run_folder_name}/.pueue_files/log* -f
+    machine.run_code(f"""rm {run_folder_name}/.pueue_files/log* -f
     touch {run_folder_name}/log
     mkdir -p {run_folder_name}/.pueue_files
     """)
