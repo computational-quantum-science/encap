@@ -161,8 +161,8 @@ Dataproc relocates it to its saved-run path in the worker workspace, retaining
 dependencies at their original locations. Its scripts should use the worker root
 for dependency paths rather than assuming the source directory is the cwd.
 The flattened local output directory alone is not a dependency workspace.
-Built-in execution and plugins without dependency support reject nonempty lists
-rather than silently ignoring them.
+Built-in execution and plugins without dependency support ignore this list;
+they do not copy or validate the specified dependency paths.
 
 `wait` polls every five seconds, streams no logs and pulls nothing. Ctrl-C in a
 plugin `wait`/`tail` detaches with code 130, never cancelling remote work.

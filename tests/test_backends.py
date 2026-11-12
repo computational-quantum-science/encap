@@ -1511,16 +1511,22 @@ def test_root_dependency_without_core_root_never_prepares_or_submits(cli, tmp_pa
     assert not (tmp_path / "0encap_folder").exists()
 
 
-@pytest.mark.parametrize("backend_flag", [[], ["-fake"]])
-def test_dependencies_reject_unsupported_backends(cli, tmp_path, monkeypatch, backend_flag):
+@pytest.mark.parametrize("backend_flag", [[], ["-pu"], ["-sl"]])
+def test_native_backends_ignore_dependencies(cli, tmp_path, monkeypatch, backend_flag):
     module, factory, backend = cli
-    (tmp_path / "src").mkdir()
-    (tmp_path / "experiment" / ".encap.conf").write_text("dependencies: [../src]\n")
-    with pytest.raises(SystemExit) as result:
+    (tmp_path / "experiment" / ".encap.conf").write_text("dependencies: [../missing]\n")
+    with pytest.raises(AssertionError, match="must not construct machine"):
         invoke(module, monkeypatch, "run", "experiment", "-n", "trial", *backend_flag)
-    assert result.value.code == 2
     backend.submit.assert_not_called()
-    assert not (tmp_path / "0encap_folder").exists()
+
+
+def test_plugin_without_dependency_support_ignores_dependencies(cli, tmp_path, monkeypatch):
+    module, factory, backend = cli
+    (tmp_path / "experiment" / ".encap.conf").write_text("dependencies: [../missing]\n")
+    invoke(module, monkeypatch, "run", "experiment", "-n", "trial", "-fake")
+    request = backend.submit.call_args.args[0]
+    assert request.workspace_folder is None
+    assert request.workspace_dependencies == ()
 
 
 @pytest.mark.parametrize("api_version", [1, 2])

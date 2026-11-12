@@ -343,8 +343,6 @@ def dispatch(pargs, registrations, get_script_name):
             raise ConfigurationError("watch requires a saved plugin run with automatic-pull support")
         if getattr(pargs, "status_json", False):
             raise ConfigurationError("--json requires a plugin backend")
-        if effective.get("dependencies"):
-            raise ConfigurationError("dependencies require a supporting execution backend, such as Dataproc")
         settings.merge_dicts(settings.config, copy.deepcopy(settings.args_config))
         return False
     registration = _registration(name, registrations)
@@ -398,11 +396,10 @@ def dispatch(pargs, registrations, get_script_name):
     workspace_root = (
         settings.resolve_workspace_root(effective["workspace_root"]) if "workspace_root" in effective else None
     )
-    dependencies = resolve_dependencies(
-        effective.get("dependencies", []), source_dir, excluded, workspace_root=workspace_root,
+    dependencies = (
+        resolve_dependencies(effective.get("dependencies", []), source_dir, excluded, workspace_root=workspace_root)
+        if registration.supports_dependencies else []
     )
-    if dependencies and not registration.supports_dependencies:
-        raise ConfigurationError(f"Backend {name} does not support dependencies")
     namespace = effective.get("plugins", {}).get(name, PluginConfig())
     if not isinstance(namespace, PluginConfig):
         namespace = PluginConfig(namespace)
