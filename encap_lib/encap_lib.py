@@ -1,4 +1,5 @@
 import os
+import shlex
 import warnings
 import yaml
 import encap_lib.encap_settings as settings
@@ -7,6 +8,12 @@ import encap_lib.gcloud as gcloud
 from encap_lib.machines import SSHMachine, LocalMachine
 from datetime import date
 # pip install --upgrade google-api-python-client
+
+
+def workspace_root_export():
+    if "workspace_root" not in settings.config:
+        return ""
+    return f'export ENCAP_WORKSPACE_ROOT={shlex.quote(settings.config["workspace_root"])}'
 
 
 # Checks if the name of the vm matches the signature in the config file

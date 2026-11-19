@@ -16,7 +16,7 @@ import random
 import encap_lib.encap_settings as settings
 from encap_lib.machines import LocalMachine
 from encap_lib.encap_lib import get_machine, filename_and_file_extension, get_interpreter_from_file_extension, extract_folder_name, get_job_name
-from encap_lib.encap_lib import record_process, remove_process_from_database
+from encap_lib.encap_lib import record_process, remove_process_from_database, workspace_root_export
 from encap_lib import slurm
 import encap_lib.pueue
 from encap_lib.status import get_status, print_status, print_daemon_status
@@ -189,6 +189,7 @@ def run(machine, file_extension, target, args, run_folder_name, target_file, tar
         code = f'''
         set -e # Exit on error
         
+        {workspace_root_export()}
         cd {shlex.quote(run_folder_name)}
         mkdir -p {shlex.quote(native_wait.DIRECTORY)}
         rm -f {shlex.quote(native_wait.exit_filename(i))}

@@ -428,7 +428,9 @@ Supplying any registered plugin CLI option also selects its backend.
 The factory receives a `PluginConfig` mapping containing only `plugins.example`.
 Its `workspace_root` attribute is the resolved top-level root (`Path` or `None`),
 not an injected plugin setting. Backends may use this shared metadata without
-accepting additional keys in their own configuration namespace.
+accepting additional keys in their own configuration namespace. Plugins that
+support a workspace root should export `ENCAP_WORKSPACE_ROOT` as the root's
+execution-machine path when running the experiment.
 Use `config.resolve_path("key")` for local configuration-relative paths.
 
 **Save recovery information before submission:** call

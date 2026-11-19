@@ -1,7 +1,57 @@
+import os
+import subprocess
+import sys
+
 import pytest
 from unittest.mock import MagicMock
 from encap_lib import slurm
 from encap_lib import pueue
+
+
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_pueue_daemon_start_does_not_wait_for_inherited_output(tmp_path, startup_fails):
+    pueue_command = tmp_path / "pueue"
+    pueue_command.write_text("#!/bin/sh\nexit 1\n")
+    pueue_command.chmod(0o755)
+    daemon = tmp_path / "pueued"
+    daemon.write_text(
+        f"#!{sys.executable}\n"
+        "import os, signal, time\n"
+        "if os.environ['ENCAP_TEST_DAEMON_FAIL'] == '1':\n"
+        "    print('daemon startup failed', flush=True)\n"
+        "    raise SystemExit(17)\n"
+        "with open(os.environ['ENCAP_TEST_SIGHUP'], 'w') as result:\n"
+        "    result.write(str(signal.getsignal(signal.SIGHUP) == signal.SIG_IGN))\n"
+        "if os.fork() == 0:\n"
+        "    deadline = time.monotonic() + 10\n"
+        "    while not os.path.exists(os.environ['ENCAP_TEST_DAEMON_STOP']) and time.monotonic() < deadline:\n"
+        "        time.sleep(0.05)\n"
+        "    os._exit(0)\n"
+        "print('Pueued is now running in the background', flush=True)\n"
+    )
+    daemon.chmod(0o755)
+    stop_file = tmp_path / "stop"
+    signal_file = tmp_path / "sighup"
+    environment = dict(os.environ, PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+                       ENCAP_TEST_DAEMON_STOP=str(stop_file), ENCAP_TEST_DAEMON_FAIL=str(int(startup_fails)),
+                       ENCAP_TEST_SIGHUP=str(signal_file))
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "from encap_lib.machines import LocalMachine; "
+             "from encap_lib.pueue import ensure_daemon_running; "
+             "ensure_daemon_running(LocalMachine('.'))"],
+            env=environment, capture_output=True, text=True, timeout=2,
+        )
+    finally:
+        stop_file.touch()
+    if startup_fails:
+        assert result.returncode != 0
+        assert "daemon startup failed" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "Pueued is now running in the background" in result.stdout
+        assert signal_file.read_text() == "True"
+
 
 def test_generate_slurm_variables():
     slurm_settings = {
@@ -23,6 +73,51 @@ def test_generate_slurm_variables():
     assert "#SBATCH --time=01:00:00" in code
     assert "#SBATCH --job-name=test_job" in code
     assert "srun bash run.sh" in code
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pueue"])
+def test_scheduler_wrapper_exports_workspace_root(tmp_path, monkeypatch, scheduler):
+    from encap_lib import encap_settings as settings
+    project = tmp_path / "project"
+    project.mkdir()
+    root = tmp_path / "root with spaces"
+    root.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setitem(settings.config, "workspace_root", str(root))
+    monkeypatch.setitem(settings.config, "interpreter", sys.executable + " -u")
+    script = project / "run.py"
+    script.write_text("import os; print(os.environ['ENCAP_WORKSPACE_ROOT'])")
+    generate = slurm.generate_slurm_executable if scheduler == "slurm" else pueue.generate_pueue_executable
+    code, _ = generate("py", str(project), str(script), "", "run.py")
+    wrapper = project / "wrapper.sh"
+    wrapper.write_text(code)
+    result = subprocess.run(["bash", str(wrapper)], env=dict(os.environ, SLURM_PROCID="0"), capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert str(root.resolve()) in (project / "log").read_text()
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pueue"])
+def test_scheduler_workspace_root_uses_config_on_execution_machine(tmp_path, monkeypatch, scheduler):
+    from encap_lib import encap_settings as settings
+    local_project = tmp_path / "local" / "project"
+    remote_project = tmp_path / "remote" / "project"
+    local_project.mkdir(parents=True)
+    remote_project.mkdir(parents=True)
+    monkeypatch.chdir(local_project)
+    configured_root = local_project.parent / "workspace with spaces"
+    monkeypatch.setitem(settings.config, "workspace_root", str(configured_root))
+    monkeypatch.setitem(settings.config, "interpreter", sys.executable + " -u")
+    script = remote_project / "run.py"
+    script.write_text("import os; print(os.environ['ENCAP_WORKSPACE_ROOT'])")
+    generate = slurm.generate_slurm_executable if scheduler == "slurm" else pueue.generate_pueue_executable
+    code, _ = generate("py", str(remote_project), str(script), "", "run.py")
+    wrapper = remote_project / "wrapper.sh"
+    wrapper.write_text(code)
+    result = subprocess.run(["bash", str(wrapper)], cwd=remote_project,
+                            env=dict(os.environ, SLURM_PROCID="0"), capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert str(configured_root) in (remote_project / "log").read_text()
+
 
 def test_pueue_run(mocker):
     # Mock machine

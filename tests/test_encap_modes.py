@@ -84,6 +84,22 @@ def test_folder_mode(tmp_path, mocker, monkeypatch):
     assert "hello from folder mode" in log_file.read_text()
 
 
+def test_local_run_exports_workspace_root(tmp_path, mocker, monkeypatch):
+    encap = load_encap(tmp_path)
+    mocker.patch.object(encap, "tail_pull", return_value=None)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".encap.conf").write_text("workspace_root: ..\n")
+    (project / "run.py").write_text("import os; print(os.environ['ENCAP_WORKSPACE_ROOT'])")
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(sys, "argv", ["encap", "run", "run.py", "-n", "trial"])
+    encap.main()
+    from encap_lib import native_wait
+    folder = project / "run" / "trial"
+    native_wait.wait(encap.LocalMachine(str(project)), str(folder), interval=0.01)
+    assert str(tmp_path.resolve()) in (folder / "log").read_text()
+
+
 @pytest.mark.parametrize("code", [0, 7])
 def test_local_wait_preserves_real_exit_code(tmp_path, mocker, monkeypatch, code):
     encap = load_encap(tmp_path)

@@ -1,5 +1,5 @@
 import encap_lib.encap_settings as settings
-from encap_lib.encap_lib import get_interpreter_from_file_extension, get_job_name
+from encap_lib.encap_lib import get_interpreter_from_file_extension, get_job_name, workspace_root_export
 import sys
 import os
 import warnings
@@ -23,7 +23,11 @@ def ensure_daemon_running(machine, auto_start=True):
         sys.exit(1)
         
     if auto_start:
-        machine.run_code("pueued -d", verbose=True)
+        machine.run_code(
+            'log=$(mktemp) || exit 1; nohup pueued -d </dev/null >"$log" 2>&1; '
+            'result=$?; cat "$log"; rm -f "$log"; exit "$result"',
+            verbose=True,
+        )
     else:
         print("Error: pueue daemon is not running and auto_start is disabled. Run `pueued -d`.")
         sys.exit(1)
@@ -48,6 +52,7 @@ def generate_pueue_executable(file_extension, run_folder_name, target_file_path,
     args = args.replace("{i}", f"{pueue_instance}")
         
     code = f'''#!/bin/bash
+    {workspace_root_export()}
     export ENCAP_NAME="{run_folder_name}"
     export ENCAP_PROCID={pueue_instance}
     export ENCAP_JOB_NAME="{job_name}"

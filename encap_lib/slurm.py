@@ -1,5 +1,5 @@
 import encap_lib.encap_settings as settings
-from encap_lib.encap_lib import get_interpreter_from_file_extension
+from encap_lib.encap_lib import get_interpreter_from_file_extension, workspace_root_export
 import yaml
 import sys
 import os
@@ -82,6 +82,7 @@ def generate_slurm_executable(file_extension, run_folder_name, target_file_path,
     args = args.replace("{i}", f"{slurm_instance}")
         
     code = f'''#!/bin/bash
+    {workspace_root_export()}
     export ENCAP_SLURM_INSTANCE={slurm_instance}
     export ENCAP_PROCID=$(({slurm_instance * ntpn} + $SLURM_PROCID))
     export ENCAP_JOB_NAME="{job_name}"
